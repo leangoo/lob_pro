@@ -47,13 +47,17 @@ defmodule Oban.Pro.Workers.Chunk do
   each of the possible results:
 
   * `:ok` — The chunk succeeded and all jobs can be marked complete
-  * `{:ok, result}` — Like `:ok`, but with a result for testing
+
+  * `{:ok, result}` — Like `:ok`, but with a result for testing.
+
   * `{:error, reason, jobs}` — One or more jobs in the chunk failed and may be retried, any
-    unlisted jobs are a success
+    unlisted jobs are a success.
+
   * `{:cancel, reason, jobs}` — One or more jobs in the chunk should be cancelled, any unlisted
-    jobs are a success
-  * `[{:error, {reason, jobs}} | {:cancel, {reason, jobs}}]` — Retry some jobs and cancel some
-    other jobs, leaving any jobs not in either list a success
+    jobs are a success.
+
+  * `[error: {reason, jobs}, cancel: {reason, jobs}]` — Retry some jobs and cancel some other
+    jobs, leaving any jobs not in either list a success.
 
   To illustrate using chunk results let's expand on the message processing example from earlier.
   We'll extend it to complete the whole batch when all messages are delivered or cancel
@@ -104,11 +108,13 @@ defmodule Oban.Pro.Workers.Chunk do
   @type jobs :: [Job.t()]
   @type reason :: term()
 
+  @type sub_result :: {reason(), jobs()}
+
   @type result ::
           :ok
-          | {:ok, term}
+          | {:ok, term()}
           | {:cancel | :discard | :error, reason(), jobs()}
-          | [{:cancel | :discard | :error, {reason(), jobs()}}]
+          | [cancel: sub_result(), discard: sub_result(), error: sub_result()]
 
   defmacro __using__(opts) do
     {chunk_opts, stand_opts} = Keyword.split(opts, [:size, :sleep, :timeout])
@@ -305,7 +311,7 @@ defmodule Oban.Pro.Workers.Chunk do
       Multi.new()
       |> Multi.update_all(:com, ids_query(oks), com_ups())
       |> Multi.update_all(:err, ids_query(ers), err_ups(worker, job, {:error, reason}))
-      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, {:discard, reason}))
+      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, {:error, reason}))
 
     with {:ok, _result} <- Repo.transaction(conf, multi) do
       if MapSet.member?(set, job.id), do: {:error, reason}, else: :ok
@@ -338,32 +344,32 @@ defmodule Oban.Pro.Workers.Chunk do
     end
   end
 
-  defp ack_multiple(conf, worker, job, chunk, multiple) do
-    {can_reason, cancelled} = Keyword.get(multiple, :cancel, {nil, []})
-    {dis_reason, discarded} = Keyword.get(multiple, :discard, {nil, []})
-    {err_reason, retryable} = Keyword.get(multiple, :error, {nil, []})
+  defp ack_multiple(conf, worker, host, chunk, multiple) do
+    {oks, result} = split_multiple_result(host, chunk, multiple)
 
-    {can, _oks, can_set} = split_with_set(cancelled, chunk)
-    {dis, _oks, dis_set} = split_with_set(discarded, chunk)
-    {err, _oks, err_set} = split_with_set(retryable, chunk)
-    {_oth, oks, _ok_set} = split_with_set(can ++ dis ++ err, chunk)
+    group = fn {oper, reason, %{attempt: attempt}} -> {oper, reason, attempt} end
+    multi = Multi.update_all(Multi.new(), :com, ids_query(oks), com_ups())
 
     multi =
-      Multi.new()
-      |> Multi.update_all(:com, ids_query(oks), com_ups())
-      |> Multi.update_all(:can, ids_query(can), can_ups(worker, job, can_reason))
-      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, {:discard, dis_reason}))
-      |> Multi.update_all(:err, ids_query(err), err_ups(worker, job, {:error, err_reason}))
+      for({oper, {reas, jobs}} <- multiple, job <- jobs, job.id != host.id, do: {oper, reas, job})
+      |> Enum.map(&maybe_discard/1)
+      |> Enum.group_by(group, &elem(&1, 2))
+      |> Enum.with_index()
+      |> Enum.reduce(multi, fn {{{oper, reason, _}, jobs}, index}, acc ->
+        update =
+          case oper do
+            :cancel -> can_ups(worker, hd(jobs), {:cancel, reason})
+            :discard -> dis_ups(worker, hd(jobs), {:discard, reason})
+            :error -> err_ups(worker, hd(jobs), {:error, reason})
+          end
 
-    with {:ok, _result} <- Repo.transaction(conf, multi) do
-      cond do
-        MapSet.member?(can_set, job.id) -> {:cancel, err_reason}
-        MapSet.member?(dis_set, job.id) -> {:discard, dis_reason}
-        MapSet.member?(err_set, job.id) -> {:error, err_reason}
-        true -> :ok
-      end
-    end
+        Multi.update_all(acc, {oper, index}, ids_query(jobs), update)
+      end)
+
+    with {:ok, _} <- Repo.transaction(conf, multi), do: result
   end
+
+  # Single Helpers
 
   defp ids_query(jobs) do
     where(Job, [j], j.id in ^Enum.map(jobs, & &1.id))
@@ -379,6 +385,30 @@ defmodule Oban.Pro.Workers.Chunk do
 
   defp exhausted?(%Job{attempt: attempt, max_attempts: max}), do: attempt >= max
 
+  # Multiple Helpers
+
+  defp split_multiple_result(%{id: jid}, chunk, multiple) do
+    set = for {_, {_, jobs}} <- multiple, %{id: id} <- jobs, into: MapSet.new(), do: id
+
+    result =
+      if MapSet.member?(set, jid) do
+        {oper, {reason, _}} =
+          Enum.find(multiple, fn {_, {_, jobs}} -> jid in Enum.map(jobs, & &1.id) end)
+
+        {oper, reason}
+      else
+        :ok
+      end
+
+    {Enum.reject(chunk, &MapSet.member?(set, &1.id)), result}
+  end
+
+  defp maybe_discard({:error, reason, job}) when job.attempt >= job.max_attempts do
+    {:discard, reason, job}
+  end
+
+  defp maybe_discard(tuple), do: tuple
+
   # Update Helpers
 
   defp com_ups do
@@ -386,7 +416,7 @@ defmodule Oban.Pro.Workers.Chunk do
   end
 
   defp can_ups(worker, job, reason) do
-    error = format_error(job, worker, {:cancel, reason}, [])
+    error = format_error(job, worker, reason, [])
 
     Keyword.new()
     |> Keyword.put(:set, state: "cancelled", cancelled_at: utc_now())

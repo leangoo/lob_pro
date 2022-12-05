@@ -1,7 +1,7 @@
 defmodule Oban.Pro.MixProject do
   use Mix.Project
 
-  @version "0.12.7"
+  @version "0.12.9"
 
   def project do
     [
@@ -64,7 +64,8 @@ defmodule Oban.Pro.MixProject do
       {:credo, "~> 1.6", only: [:test, :dev], runtime: false},
       {:dialyxir, "~> 1.0", only: [:test, :dev], runtime: false},
       {:ex_doc, "~> 0.21", only: [:dev], runtime: false},
-      {:makeup_diff, "~> 0.1", only: [:dev], runtime: false}
+      {:makeup_diff, "~> 0.1", only: [:dev], runtime: false},
+      {:lys_publish, "~> 0.1", only: [:dev], path: "../lys_publish", runtime: false}
     ]
   end
 
@@ -75,7 +76,7 @@ defmodule Oban.Pro.MixProject do
         "cmd git push",
         "cmd git push --tags",
         "hex.publish package --yes",
-        "hex.build"
+        "lys.publish"
       ],
       "test.reset": ["ecto.drop -r Oban.Pro.Repo", "test.setup"],
       "test.setup": ["ecto.create -r Oban.Pro.Repo --quiet", "ecto.migrate -r Oban.Pro.Repo"],

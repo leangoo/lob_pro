@@ -743,27 +743,37 @@ defmodule Oban.Pro.Testing do
 
   # Chunk Helpers
 
+  @ops ~w(cancel discard error)a
+
   defp assert_valid_chunk_result(result) do
     valid? =
       case result do
-        :ok -> true
-        {:ok, _value} -> true
-        {:error, _reason, [_ | _]} -> true
-        {:discard, _reason, [_ | _]} -> true
-        [{:error, {_reason, [_ | _]}} | _] -> true
-        [{:discard, {_reason, [_ | _]}} | _] -> true
-        _ -> false
+        :ok ->
+          true
+
+        {:ok, _value} ->
+          true
+
+        {ops, _reason, [_ | _]} when ops in @ops ->
+          true
+
+        [{_op, {_reason, _jobs}} | _] = list ->
+          Keyword.keyword?(list) and
+            Enum.all?(list, &match?({_key, {_reason, [_ | _]}}, &1))
+
+        _ ->
+          false
       end
 
     assert valid?, """
     Expected result to be one of
 
       - `:ok`
-      - `:discard`
       - `{:ok, value}`
-      - `{:error, reason, jobs}`
+      - `{:cancel, reason, jobs}`
       - `{:discard, reason, jobs}`
-      - `[{:error, {reason, jobs}} | {:discard, {reason, jobs}}]`
+      - `{:error, reason, jobs}`
+      - `[cancel: {reason, jobs}, discard: {reason, jobs}, error: {reason, jobs}]`
 
     Instead received:
 

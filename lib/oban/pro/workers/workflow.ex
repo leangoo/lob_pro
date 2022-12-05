@@ -277,9 +277,8 @@ defmodule Oban.Pro.Workers.Workflow do
 
   ## Fetching Workflow Jobs
 
-  The `c:all_workflow_jobs/1,2` function simplifies loading all jobs in a
-  workflow from within a worker. For example, to fetch all of the jobs in a
-  workflow:
+  The `c:all_workflow_jobs/1,2` function simplifies loading all jobs in a workflow from within a
+  worker. For example, to fetch all of the jobs in a workflow:
 
   ```elixir
   defmodule MyApp.Workflow do
@@ -287,9 +286,9 @@ defmodule Oban.Pro.Workers.Workflow do
 
     @impl Workflow
     def process(%Job{} = job) do
-      {:ok, workflow_jobs} = all_workflow_jobs(job)
-
-      do_things_with_jobs(workflow_jobs)
+      job
+      |> all_workflow_jobs()
+      |> do_things_with_jobs()
 
       :ok
     end
@@ -299,13 +298,13 @@ defmodule Oban.Pro.Workers.Workflow do
   It's also possible to scope fetching to only dependencies of the current job:
 
   ```elixir
-  {:ok, deps} = all_workflow_jobs(job, only_deps: true)
+  deps = all_workflow_jobs(job, only_deps: true)
   ```
 
   Or only a single explicit dependency:
 
   ```elixir
-  {:ok, [dep_job]} = all_workflow_jobs(job, deps: [:a])
+  [dep_job] = all_workflow_jobs(job, names: [:a])
   ```
 
   For large workflows it's not efficient to load all jobs in memory at once. In
@@ -441,8 +440,8 @@ defmodule Oban.Pro.Workers.Workflow do
   @type append_option :: new_option() | {:check_deps, boolean()}
 
   @type fetch_opts ::
-          {:deps, [atom()]}
-          | {:log, Logger.level()}
+          {:log, Logger.level()}
+          | {:names, [atom()]}
           | {:only_deps, boolean()}
           | {:timeout, timeout()}
 
@@ -550,20 +549,20 @@ defmodule Oban.Pro.Workers.Workflow do
 
       @impl Workflow
       def process(%Job{} = job) do
-        {:ok, workflow_jobs} = all_workflow_jobs(job)
-
-        do_things_with_jobs(workflow_jobs)
+        job
+        |> all_workflow_jobs()
+        |> do_things_with_jobs()
 
         :ok
       end
 
   Retrieve only current job's deps:
 
-      {:ok, workflow_jobs} = all_workflow_jobs(job, only_deps: true)
+      workflow_jobs = all_workflow_jobs(job, only_deps: true)
 
   Retrieve an explicit list of dependencies:
 
-      {:ok, [job_a, job_b]} = all_workflow_jobs(job, deps: [:a, :b])
+      [job_a, job_b] = all_workflow_jobs(job, names: [:a, :b])
   """
   @callback all_workflow_jobs(Job.t(), [fetch_opts()]) :: [Job.t()]
 

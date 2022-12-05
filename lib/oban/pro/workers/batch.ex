@@ -157,8 +157,8 @@ defmodule Oban.Pro.Workers.Batch do
 
   * `c:handle_discarded/1` — called after **any jobs** in the batch have a `discarded` state.
 
-  * `c:handle_exhausted/1` — called after **all jobs** in the batch have either a `completed` or
-    `discarded` state.
+  * `c:handle_exhausted/1` — called after **all jobs** in the batch have a `cancelled`,
+    `completed` or `discarded` state.
 
   Each handler callback receives an `Oban.Job` struct with the `batch_id` in
   `meta` and should return `:ok`. The callbacks are executed as separate
@@ -428,9 +428,9 @@ defmodule Oban.Pro.Workers.Batch do
       @impl Batch
       def handle_completed(%Job{} = job) do
         results =
-            job
-            |> all_batch_jobs(job)
-            |> Enum.map(&fetch_recorded/1)
+          job
+          |> all_batch_jobs()
+          |> Enum.map(&fetch_recorded/1)
 
         MyApp.Mailer.notify_admins_about_results(results)
       end
