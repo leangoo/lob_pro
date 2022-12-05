@@ -14,10 +14,13 @@ defmodule Oban.Pro.Queue.SmartEngine do
   import DateTime, only: [utc_now: 0]
 
   alias Ecto.{Changeset, Multi}
-  alias Oban.{Config, Engine, Job, Repo}
+  alias Oban.{Backoff, Config, Engine, Job, Repo}
   alias Oban.Engines.Basic
   alias Oban.Pro.Limiters.{Global, Rate}
   alias Oban.Pro.{Producer, Utils}
+
+  @base_batch_size 1_000
+  @uniq_batch_size 250
 
   defmacrop dec_tracked_count(meta, key) do
     quote do
@@ -80,8 +83,8 @@ defmodule Oban.Pro.Queue.SmartEngine do
   @impl Engine
   def refresh(%Config{} = conf, %Producer{name: name, queue: queue} = producer) do
     now = utc_now()
-    outdated_at = DateTime.add(now, -2 * producer.refresh_interval, :millisecond)
-    vanished_at = DateTime.add(now, -9 * producer.refresh_interval, :millisecond)
+    outdated_at = interval_multiple(now, producer, 2)
+    vanished_at = interval_multiple(now, producer, 120)
 
     update_query =
       Producer
@@ -107,6 +110,12 @@ defmodule Oban.Pro.Queue.SmartEngine do
 
       %{producer | updated_at: now}
     end)
+  end
+
+  defp interval_multiple(now, producer, mult) do
+    time = Backoff.jitter(-mult * producer.refresh_interval, mode: :inc)
+
+    DateTime.add(now, time, :millisecond)
   end
 
   @impl Engine
@@ -145,13 +154,29 @@ defmodule Oban.Pro.Queue.SmartEngine do
 
   @impl Engine
   def check_meta(_conf, %Producer{} = producer, _running) do
-    meta = Map.from_struct(producer.meta)
+    meta =
+      producer.meta
+      |> Map.from_struct()
+      |> flatten_windows()
 
     producer
     |> Map.take([:name, :node, :queue, :started_at, :updated_at])
     |> Map.merge(meta)
     |> Map.put(:running, producer.running_ids)
   end
+
+  defp flatten_windows(%{rate_limit: %{windows: windows}} = meta) do
+    {pacc, cacc} =
+      Enum.reduce(windows, {0, 0}, fn map, {pacc, cacc} ->
+        %{"prev_count" => prev, "curr_count" => curr} = map
+
+        {pacc + prev, cacc + curr}
+      end)
+
+    put_in(meta.rate_limit.windows, [%{"curr_count" => cacc, "prev_count" => pacc}])
+  end
+
+  defp flatten_windows(meta), do: meta
 
   @impl Engine
   def fetch_jobs(_conf, %{meta: %{paused: true}} = prod, _running) do
@@ -371,7 +396,10 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   defp inner_insert_all(conf, changesets, opts) do
-    batch_size = Keyword.get(opts, :batch_size, 1_000)
+    batch_size =
+      Keyword.get_lazy(opts, :batch_size, fn ->
+        if Enum.any?(changesets, &unique?/1), do: @uniq_batch_size, else: @base_batch_size
+      end)
 
     changesets
     |> Enum.map(&with_uniq_key/1)
