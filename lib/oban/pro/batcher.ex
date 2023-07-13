@@ -3,7 +3,7 @@ defmodule Oban.Pro.Batcher do
 
   import Ecto.Query, only: [distinct: 2, select: 3, union: 2, where: 3]
 
-  alias Oban.Pro.Queue.SmartEngine
+  alias Oban.Pro.Engines.Smart
   alias Oban.{Job, Repo, Worker}
 
   require Logger
@@ -173,7 +173,7 @@ defmodule Oban.Pro.Batcher do
       |> structured_error_message()
       |> Logger.error()
     else
-      {:ok, SmartEngine.insert_job(conf, changeset, [])}
+      {:ok, Smart.insert_job(conf, changeset, [])}
     end
   end
 

@@ -25,7 +25,7 @@ defmodule Oban.Pro.Plugins.DynamicLifeline do
 
       plugins: [{Oban.Pro.Plugins.DynamicLifeline, timeout: :timer.minutes(1)}]
 
-  Note that rescuing orphans relies on producer records as used by the `SmartEngine`.
+  Note that rescuing orphans relies on producer records as used by the `Smart` engine.
 
   ## Rescuing Exhausted Jobs
 
@@ -65,8 +65,8 @@ defmodule Oban.Pro.Plugins.DynamicLifeline do
 
   import Ecto.Query, only: [join: 5, select: 3, where: 3]
 
+  alias Oban.Pro.Engines.Smart
   alias Oban.Pro.Producer
-  alias Oban.Pro.Queue.SmartEngine
   alias Oban.{Job, Peer, Repo, Validation}
 
   @type option ::
@@ -98,16 +98,16 @@ defmodule Oban.Pro.Plugins.DynamicLifeline do
   @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
     case opts[:conf] do
-      %{engine: SmartEngine} ->
+      %{engine: Smart} ->
         GenServer.start_link(__MODULE__, opts, name: opts[:name])
 
       %{engine: engine} ->
         raise RuntimeError, """
-        The DynamicLifeline plugin requires the SmartEngine to run correctly, but you're using:
+        DynamicLifeline requires the Smart engine to run correctly, but you're using:
 
         engine: #{inspect(engine)}
 
-        You can either switch to use the SmartEngine or remove DynamicLifeline from your plugins.
+        You can either switch to use the Smart or remove DynamicLifeline from your plugins.
         """
     end
   end

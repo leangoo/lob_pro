@@ -216,7 +216,7 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
   import Ecto.Query, only: [order_by: 2, where: 2]
 
   alias Ecto.Multi
-  alias Oban.Pro.Queue.SmartEngine
+  alias Oban.Pro.Engines.Smart
   alias Oban.Pro.{Queue, Utils}
   alias Oban.{Config, Midwife, Notifier, Peer, Registry, Repo, Validation}
 
@@ -481,16 +481,16 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
   # Validations
 
   defp validate_engine(%Config{engine: engine}) do
-    if engine == SmartEngine do
+    if engine == Smart do
       :ok
     else
       {:error,
        """
-       The DynamicQueues plugin requires the SmartEngine to run correctly, but you're using:
+       DynamicQueues requires the Smart engine to run correctly, but you're using:
 
        engine: #{inspect(engine)}
 
-       You can either use the SmartEngine or remove DynamicQueue from your plugins.
+       You can either use the Smart engine or remove DynamicQueue from your plugins.
        """}
     end
   end

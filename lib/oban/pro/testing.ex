@@ -49,7 +49,7 @@ defmodule Oban.Pro.Testing do
   alias Ecto.Adapters.SQL.Sandbox
   alias Ecto.Changeset
   alias Oban.{Config, Job, Repo, Worker}
-  alias Oban.Pro.Queue.SmartEngine
+  alias Oban.Pro.Engines.Smart
   alias Oban.Pro.Workers.{Chunk, Workflow}
   alias Oban.Queue.Executor
 
@@ -165,7 +165,7 @@ defmodule Oban.Pro.Testing do
   @callbacks ~w(attempted completed discarded exhausted)a
 
   @default_supervised_opts [
-    engine: Oban.Pro.Queue.SmartEngine,
+    engine: Oban.Pro.Engines.Smart,
     notifier: Oban.Notifiers.PG,
     peer: Oban.Pro.Testing.Peer,
     stage_interval: :infinity,
@@ -243,7 +243,7 @@ defmodule Oban.Pro.Testing do
     * It can drain jobs across one or all queues simultaneously
     * It can return the drained jobs rather than a count summary
     * It optimizes the defaults for testing batches, workflows, etc.
-    * It always uses the `SmartEngine` to guarantee that Pro worker features work as expected
+    * It always uses the `Smart` engine to guarantee that Pro worker features work as expected
 
   ## Options
 
@@ -332,11 +332,6 @@ defmodule Oban.Pro.Testing do
   @doc since: "0.11.0"
   @spec perform_job(Worker.t(), term(), [perform_option()]) :: Worker.result()
   defdelegate perform_job(worker, args, opts), to: Oban.Testing
-
-  @doc since: "0.9.0"
-  @doc deprecated: "Use perform_job/3 instead"
-  @spec process_job(Worker.t(), term(), [perform_option()]) :: Worker.result()
-  defdelegate process_job(worker, args, opts), to: Oban.Testing, as: :perform_job
 
   @doc """
   Construct and execute a job with a batch `handle_*` callback.
@@ -503,7 +498,7 @@ defmodule Oban.Pro.Testing do
     @default_supervised_opts
     |> Keyword.merge(conf_opts)
     |> Config.new()
-    |> SmartEngine.insert_all_jobs(changesets, [])
+    |> Smart.insert_all_jobs(changesets, [])
 
     opts
     |> Keyword.put_new(:queue, :all)
