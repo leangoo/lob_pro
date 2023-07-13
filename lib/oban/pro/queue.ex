@@ -33,7 +33,6 @@ defmodule Oban.Pro.Queue do
         @moduledoc false
 
         field :allowed, :integer
-        field :tracked, :map, default: %{}
 
         embeds_one :partition, Partition, on_replace: :update, primary_key: false do
           @moduledoc false
@@ -108,15 +107,28 @@ defmodule Oban.Pro.Queue do
 
   defp opts_changeset(schema, params) do
     params =
-      schema
-      |> merge_opts(params)
+      params
+      |> Map.new(fn {key, val} -> {Utils.maybe_to_atom(key), val} end)
       |> Map.delete(:limit)
-      |> Map.update(:global_limit, nil, &Producer.cast_global_limit/1)
-      |> Map.update(:rate_limit, nil, &Producer.cast_rate_limit/1)
       |> Map.put_new_lazy(:local_limit, fn -> Producer.default_local_limit(params, schema) end)
 
+    # NOTE: Switch to `replace_lazy/3` when we require Elixir 1.14+
+    params =
+      if Map.get(params, :global_limit) do
+        Map.update!(params, :global_limit, &Producer.cast_global_limit/1)
+      else
+        params
+      end
+
+    params =
+      if Map.get(params, :rate_limit) do
+        Map.update!(params, :rate_limit, &Producer.cast_rate_limit/1)
+      else
+        params
+      end
+
     schema
-    |> cast(params, ~w(local_limit paused)a)
+    |> cast(params, ~w(local_limit paused retry_attempts retry_backoff)a)
     |> cast_embed(:global_limit, with: &Producer.global_changeset/2)
     |> cast_embed(:rate_limit, with: &rate_changeset/2)
     |> validate_required(~w(local_limit)a)
@@ -149,31 +161,18 @@ defmodule Oban.Pro.Queue do
   end
 
   @spec to_keyword_opts(%{opts: map()} | map()) :: Keyword.t()
-  def to_keyword_opts(%__MODULE__{opts: opts}) do
+  def to_keyword_opts(%__MODULE__{name: queue, opts: opts}) do
     opts
     |> Ecto.embedded_dump(:json)
+    |> Map.put(:queue, queue)
     |> to_keyword_opts()
   end
 
   def to_keyword_opts(opts) do
-    opts
-    |> Enum.reject(fn {_ky, val} -> is_nil(val) end)
-    |> Keyword.new(fn {key, val} -> {Utils.maybe_to_atom(key), val} end)
+    for {key, val} <- opts, not is_nil(val), do: {Utils.maybe_to_atom(key), val}
   end
 
   # Helpers
-
-  defp merge_opts(opts, params) do
-    old_opts =
-      opts
-      |> Map.from_struct()
-      |> Enum.reject(fn {_ky, val} -> is_nil(val) end)
-      |> Map.new()
-
-    new_opts = Map.new(params, fn {key, val} -> {Utils.maybe_to_atom(key), val} end)
-
-    Map.merge(old_opts, new_opts)
-  end
 
   defp cast_only({:node, value}), do: cast_only({:node, :==, value})
   defp cast_only({:node, op, value}), do: %{mode: :node, op: op, value: to_string(value)}

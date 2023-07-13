@@ -31,7 +31,7 @@ defmodule Oban.Pro.Relay do
 
   ```elixir
   {:ok, result} =
-    %{:ok, 4}
+    %{id: 123}
     |> MyApp.Worker.new()
     |> Oban.Pro.Relay.async()
     |> Oban.Pro.Relay.await()

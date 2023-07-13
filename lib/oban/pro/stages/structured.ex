@@ -3,79 +3,173 @@ defmodule Oban.Pro.Stages.Structured do
 
   @behaviour Oban.Pro.Stage
 
-  defstruct [:worker, keys: [], required: []]
+  alias Ecto.Changeset
+  alias Oban.Pro.Utils
+
+  defstruct [:worker]
 
   @impl Oban.Pro.Stage
-  def init(worker, opts) do
-    with {:ok, keys} <- fetch_opt(opts, :keys),
-         {:ok, required} <- fetch_opt(opts, :required),
-         :ok <- check_subset(keys, required) do
-      {:ok, %__MODULE__{keys: keys, required: required, worker: worker}}
-    end
-  end
-
-  @impl Oban.Pro.Stage
-  def before_new(args, opts, conf) do
-    with :ok <- check_args(args, conf) do
-      meta = %{"structured" => true}
-      opts = Keyword.update(opts, :meta, meta, &Map.merge(&1, meta))
-
-      {:ok, args, opts}
-    end
-  end
-
-  @impl Oban.Pro.Stage
-  def before_process(%{args: args} = job, conf) do
-    with :ok <- check_args(args, conf) do
-      args = Map.new(args, fn {key, val} -> {String.to_existing_atom(key), val} end)
-
-      {:ok, %{job | args: struct!(conf.worker, args)}}
-    end
-  end
-
-  # Helpers
-
-  defp fetch_opt(opts, key) do
-    set =
-      opts
-      |> Keyword.get(key, [])
-      |> MapSet.new(&to_string/1)
-
-    {:ok, set}
-  end
-
-  defp check_subset(keys, required) do
-    if MapSet.subset?(required, keys) do
-      :ok
+  def init(worker, _opts) do
+    if function_exported?(worker, :__args_schema__, 0) do
+      {:ok, %__MODULE__{worker: worker}}
     else
-      error("some :required aren't included in :keys ", required, keys)
+      {:ok, :ignore}
     end
   end
 
-  defp check_args(args, %{keys: keys, required: required}) do
-    args_keys =
-      args
-      |> Map.keys()
-      |> MapSet.new(&to_string/1)
+  def legacy_to_schema(opts) do
+    opts
+    |> to_normal()
+    |> to_quoted()
+  end
+
+  @impl Oban.Pro.Stage
+  def before_new(args, opts, :ignore), do: {:ok, args, opts}
+
+  def before_new(args, opts, conf) do
+    {:ok, _changes} = gather_changes(conf.worker, args)
+
+    meta = %{"structured" => true}
+    opts = Keyword.update(opts, :meta, meta, &Map.merge(&1, meta))
+
+    {:ok, args, opts}
+  catch
+    message -> {:error, message}
+  end
+
+  @impl Oban.Pro.Stage
+  def before_process(job, :ignore), do: {:ok, job}
+
+  def before_process(%{args: args} = job, conf) do
+    {:ok, changes} = gather_changes(conf.worker, args)
+
+    {:ok, %{job | args: changes}}
+  catch
+    message -> {:error, message}
+  end
+
+  defp gather_changes(module, args) do
+    fields = module.__args_schema__()
+    struct = struct(module, [])
+
+    {fields, required, merge} = split_fields(fields, args)
+
+    keys = Map.keys(fields)
+
+    changeset =
+      {struct, fields}
+      |> Changeset.cast(args, keys)
+      |> Changeset.validate_required(required)
+      |> validate_allowed(args, keys)
+
+    if changeset.valid? do
+      changeset
+      |> Changeset.apply_changes()
+      |> Map.merge(merge)
+      |> then(&{:ok, &1})
+    else
+      changeset
+      |> Utils.to_translated_errors()
+      |> Enum.map_join(", ", fn {field, error} -> "#{inspect(field)} #{error}" end)
+      |> throw()
+    end
+  end
+
+  defp split_fields(fields, args) do
+    Enum.reduce(fields, {%{}, [], %{}}, fn {name, opts}, {keep, required, merge} ->
+      required = if opts[:required], do: [name | required], else: required
+
+      case Map.new(opts) do
+        %{cardinality: :one, module: module, type: :embed} ->
+          {:ok, embed} = gather_changes(module, args[name] || args[to_string(name)] || %{})
+
+          {Map.put(keep, name, :any), required, Map.put(merge, name, embed)}
+
+        %{cardinality: :many, module: module, type: :embed} ->
+          embed_list =
+            for sub_arg <- args[name] || args[to_string(name)] || [] do
+              {:ok, embed} = gather_changes(module, sub_arg)
+
+              embed
+            end
+
+          {Map.put(keep, name, :any), required, Map.put(merge, name, embed_list)}
+
+        %{type: :enum} ->
+          enum = {:parameterized, Ecto.Enum, Ecto.Enum.init(values: opts[:values])}
+
+          {Map.put(keep, name, enum), required, merge}
+
+        %{type: :uuid} ->
+          {Map.put(keep, name, :binary_id), required, merge}
+
+        %{type: {:array, :uuid}} ->
+          {Map.put(keep, name, {:array, :binary_id}), required, merge}
+
+        %{type: type} ->
+          {Map.put(keep, name, type), required, merge}
+      end
+    end)
+  end
+
+  defp validate_allowed(changeset, args, keys) do
+    keys = MapSet.new(keys, &to_string/1)
+
+    Enum.reduce(args, changeset, fn {key, _val}, changeset ->
+      if to_string(key) in keys do
+        changeset
+      else
+        Changeset.add_error(changeset, key, "is an unexpected key")
+      end
+    end)
+  end
+
+  # Legacy Updates
+
+  defp to_normal(opts) do
+    keys =
+      opts
+      |> Keyword.keys()
+      |> Enum.sort()
 
     cond do
-      not MapSet.subset?(args_keys, keys) ->
-        error("unexpected keys: ", args_keys, keys)
+      keys == [:keys, :required] ->
+        required = Keyword.get(opts, :required)
 
-      MapSet.size(required) > 0 and not MapSet.subset?(required, args_keys) ->
-        error("missing required keys: ", required, args_keys)
+        opts
+        |> Keyword.get(:keys)
+        |> Keyword.new(fn key ->
+          val = if key in required, do: {:*, :any}, else: :any
+
+          {key, val}
+        end)
+
+      keys == [:keys] ->
+        opts
+        |> Keyword.get(:keys)
+        |> Keyword.new(&{&1, :any})
 
       true ->
-        :ok
+        opts
     end
   end
 
-  defp error(message, set_a, set_b) do
-    diff =
-      set_a
-      |> MapSet.difference(set_b)
-      |> MapSet.to_list()
+  defp to_quoted(opts) do
+    Enum.map(opts, fn
+      {name, [v1 | _] = values} when is_atom(v1) ->
+        {:field, [], [name, :enum, [values: values]]}
 
-    {:error, message <> inspect(diff)}
+      {name, {:*, [v1 | _] = values}} when is_atom(v1) ->
+        {:field, [], [name, :enum, [required: true, values: values]]}
+
+      {name, {:*, type}} ->
+        {:field, [], [name, type, [required: true]]}
+
+      {name, [{_key, _val} | _] = nested} ->
+        {:embeds_one, [], [name, [do: {:__block__, [], to_quoted(nested)}]]}
+
+      {name, type} ->
+        {:field, [], [name, type]}
+    end)
   end
 end

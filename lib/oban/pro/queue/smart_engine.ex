@@ -1,10 +1,3 @@
-require Protocol
-
-Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.GlobalLimit)
-Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.GlobalLimit.Partition)
-Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.RateLimit)
-Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.RateLimit.Partition)
-
 defmodule Oban.Pro.Queue.SmartEngine do
   @moduledoc false
 
@@ -20,12 +13,22 @@ defmodule Oban.Pro.Queue.SmartEngine do
   alias Oban.Pro.{Producer, Utils}
 
   @base_batch_size 1_000
+  @base_xact_limit 10_000
   @uniq_batch_size 250
 
   defmacrop dec_tracked_count(meta, key) do
     quote do
       fragment(
-        "jsonb_set(?, ?, ((? #> ?)::text::int - 1)::text::jsonb)",
+        """
+        CASE (? #> ?)::text::int
+        WHEN 1 THEN ? #- ?
+        ELSE jsonb_set(?, ?, ((? #> ?)::text::int - 1)::text::jsonb)
+        END
+        """,
+        unquote(meta),
+        ["global_limit", "tracked", unquote(key), "count"],
+        unquote(meta),
+        ["global_limit", "tracked", unquote(key)],
         unquote(meta),
         ["global_limit", "tracked", unquote(key), "count"],
         unquote(meta),
@@ -122,7 +125,9 @@ defmodule Oban.Pro.Queue.SmartEngine do
   def shutdown(%Config{} = conf, %Producer{} = producer) do
     put_meta(conf, producer, :paused, true)
   catch
-    :exit, _reason ->
+    # Recording the paused state is best-effort only. There's no reason to crash at this point
+    # during shutdown.
+    _kind, _reason ->
       producer
       |> Producer.update_meta(:paused, true)
       |> Changeset.apply_action!(:update)
@@ -153,7 +158,9 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   @impl Engine
-  def check_meta(_conf, %Producer{} = producer, _running) do
+  def check_meta(_conf, %Producer{} = producer, running) do
+    jids = for {_, {_, exec}} <- running, do: exec.job.id
+
     meta =
       producer.meta
       |> Map.from_struct()
@@ -161,8 +168,8 @@ defmodule Oban.Pro.Queue.SmartEngine do
 
     producer
     |> Map.take([:name, :node, :queue, :started_at, :updated_at])
+    |> Map.put(:running, jids)
     |> Map.merge(meta)
-    |> Map.put(:running, producer.running_ids)
   end
 
   defp flatten_windows(%{rate_limit: %{windows: windows}} = meta) do
@@ -219,10 +226,9 @@ defmodule Oban.Pro.Queue.SmartEngine do
     set = [state: "completed", completed_at: utc_now()]
 
     set =
-      receive do
-        {:record_meta, meta} -> Keyword.put(set, :meta, meta)
-      after
-        0 -> set
+      case Process.delete(:oban_meta) do
+        nil -> set
+        meta -> Keyword.put(set, :meta, meta)
       end
 
     Multi.new()
@@ -239,7 +245,7 @@ defmodule Oban.Pro.Queue.SmartEngine do
   def discard_job(%Config{} = conf, %Job{} = job) do
     updates = [
       set: [state: "discarded", discarded_at: utc_now()],
-      push: [errors: %{attempt: job.attempt, at: utc_now(), error: format_blamed(job)}]
+      push: [errors: Job.format_attempt(job)]
     ]
 
     Multi.new()
@@ -261,10 +267,7 @@ defmodule Oban.Pro.Queue.SmartEngine do
         [state: "retryable", scheduled_at: seconds_from_now(seconds)]
       end
 
-    updates = [
-      set: set,
-      push: [errors: %{attempt: job.attempt, at: utc_now(), error: format_blamed(job)}]
-    ]
+    updates = [set: set, push: [errors: Job.format_attempt(job)]]
 
     Multi.new()
     |> Multi.put(:conf, conf)
@@ -295,22 +298,26 @@ defmodule Oban.Pro.Queue.SmartEngine do
 
   @impl Engine
   def cancel_job(%Config{} = conf, %Job{} = job) do
-    updates = [set: [state: "cancelled", cancelled_at: utc_now()]]
+    scoped = where(Job, id: ^job.id)
 
-    updates =
+    {subquery, updates} =
       if is_map(job.unsaved_error) do
-        error = %{attempt: job.attempt, at: utc_now(), error: format_blamed(job)}
+        updates = [
+          set: [state: "cancelled", cancelled_at: utc_now()],
+          push: [errors: Job.format_attempt(job)]
+        ]
 
-        Keyword.put(updates, :push, errors: error)
+        {scoped, updates}
       else
-        updates
+        updates = [state: "cancelled", cancelled_at: utc_now()]
+
+        {where(scoped, [j], j.state not in ^~w(cancelled completed discarded)), updates}
       end
 
     query =
       Job
-      |> where(id: ^job.id)
-      |> where([j], j.state not in ["completed", "discarded", "cancelled"])
-      |> select([:id, :args, :attempted_by, :queue, :worker])
+      |> join(:inner, [j], x in subquery(subquery), on: j.id == x.id)
+      |> select([_, x], map(x, [:id, :args, :attempted_by, :queue, :state, :worker]))
 
     Multi.new()
     |> Multi.put(:conf, conf)
@@ -323,29 +330,22 @@ defmodule Oban.Pro.Queue.SmartEngine do
 
   @impl Engine
   def cancel_all_jobs(%Config{} = conf, queryable) do
-    all_executing = fn _repo, _changes ->
-      query =
-        queryable
-        |> where(state: "executing")
-        |> select([:id, :args, :attempted_by, :queue, :worker])
+    subquery = where(queryable, [j], j.state not in ["cancelled", "completed", "discarded"])
 
-      {:ok, {0, Repo.all(conf, query)}}
-    end
+    query =
+      Job
+      |> join(:inner, [j], x in subquery(subquery), on: j.id == x.id)
+      |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
+      |> select([_, x], map(x, [:id, :args, :attempted_by, :queue, :state, :worker]))
 
-    cancel_query =
-      queryable
-      |> where([j], j.state not in ["completed", "discarded", "cancelled"])
-      |> update([j], set: [state: "cancelled", cancelled_at: ^utc_now()])
-
-    {:ok, %{cancelled: {count, _}, jobs: {_, executing}}} =
+    {:ok, %{jobs: {_count, jobs}}} =
       Multi.new()
       |> Multi.put(:conf, conf)
-      |> Multi.run(:jobs, all_executing)
+      |> Multi.update_all(:jobs, query, [], oper_opts(conf))
       |> Multi.run(:ack, &ack_cancelled_jobs/2)
-      |> Multi.update_all(:cancelled, cancel_query, [], oper_opts(conf))
       |> transaction(conf)
 
-    {:ok, {count, executing}}
+    {:ok, jobs}
   end
 
   @impl Engine
@@ -364,34 +364,26 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   @impl Engine
-  def insert_job(%Config{} = conf, %Multi{} = multi, name, fun, opts) when is_function(fun, 1) do
-    Multi.run(multi, name, fn repo, changes ->
-      insert_job(%{conf | repo: repo}, fun.(changes), opts)
-    end)
-  end
-
-  @impl Engine
-  def insert_job(%Config{} = conf, %Multi{} = multi, name, changeset, opts) do
-    Multi.run(multi, name, fn repo, _changes ->
-      insert_job(%{conf | repo: repo}, changeset, opts)
-    end)
-  end
-
-  @impl Engine
   def insert_all_jobs(conf, changesets, opts) do
-    xact_limit = Keyword.get(opts, :xact_limit, 10_000)
+    xact_limit = Keyword.get(opts, :xact_limit, @base_xact_limit)
+    batch_size = Keyword.get(opts, :batch_size, @base_batch_size)
+    uniq_count = Enum.count(changesets, &unique?/1)
 
-    changesets = Basic.expand(changesets, %{})
+    cond do
+      uniq_count == 0 and length(changesets) <= batch_size ->
+        {:ok, jobs} = insert_entries(nil, %{conf: conf, changesets: changesets, opts: opts})
 
-    if Enum.count(changesets, &unique?/1) < xact_limit do
-      {:ok, jobs} =
-        Repo.transaction(conf, fn ->
-          inner_insert_all(conf, changesets, opts)
-        end)
+        jobs
 
-      jobs
-    else
-      inner_insert_all(conf, changesets, opts)
+      uniq_count < xact_limit ->
+        inner_insert_all(conf, changesets, opts)
+
+      true ->
+        fun = fn -> inner_insert_all(conf, changesets, opts) end
+
+        {:ok, jobs} = Repo.transaction(conf, fun, opts)
+
+        jobs
     end
   end
 
@@ -430,15 +422,6 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   @impl Engine
-  def insert_all_jobs(%Config{} = conf, %Multi{} = multi, name, wrapper, opts) do
-    Multi.run(multi, name, fn repo, changes ->
-      conf = %{conf | repo: repo}
-
-      {:ok, insert_all_jobs(conf, Basic.expand(wrapper, changes), opts)}
-    end)
-  end
-
-  @impl Engine
   defdelegate retry_job(conf, job), to: Basic
 
   @impl Engine
@@ -447,7 +430,7 @@ defmodule Oban.Pro.Queue.SmartEngine do
   # Producer Fetching Helpers
 
   defp put_producer(conf, producer) do
-    Registry.put_meta(Oban.Registry, via(conf, producer.queue), producer)
+    Registry.update_value(Oban.Registry, reg_key(conf, producer), fn _ -> producer end)
   end
 
   defp get_producer(conf, job) do
@@ -459,8 +442,9 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   defp get_producer_from_registry(conf, job) do
-    with {:ok, producer} <- Registry.meta(Oban.Registry, via(conf, job.queue)) do
-      producer
+    case Oban.Registry.lookup(reg_key(conf, job)) do
+      {_pid, producer} -> producer
+      nil -> :error
     end
   end
 
@@ -490,8 +474,8 @@ defmodule Oban.Pro.Queue.SmartEngine do
     end
   end
 
-  defp via(%Config{name: name}, queue) do
-    Oban.Registry.via(name, {:producer, queue})
+  defp reg_key(%{name: name}, %{queue: queue}) do
+    {name, {:producer, queue}}
   end
 
   # Demand Helpers
@@ -516,9 +500,14 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   defp fetch_jobs(_repo, %{conf: conf, producer: producer} = changes) do
+    subset_query = fetch_subquery(changes)
+
     query =
       Job
-      |> where([j], j.id in subquery(fetch_subquery(changes)))
+      |> with_cte("subset", as: ^subset_query)
+      |> join(:inner, [j], x in fragment(~s("subset")), on: true)
+      |> where([j, x], j.id == x.id)
+      |> where([j, _], j.attempt < j.max_attempts)
       |> select([j, _], j)
 
     updates = [
@@ -533,10 +522,9 @@ defmodule Oban.Pro.Queue.SmartEngine do
         []
       end
 
-    case Repo.update_all(conf, query, updates, options) do
-      {0, nil} -> {:ok, []}
-      {_count, jobs} -> {:ok, jobs}
-    end
+    {_count, jobs} = Repo.update_all(conf, query, updates, options)
+
+    {:ok, jobs}
   end
 
   defp fetch_subquery(%{local_demand: local, producer: producer} = changes) do
@@ -579,10 +567,10 @@ defmodule Oban.Pro.Queue.SmartEngine do
       end
 
     base
+    |> select([:id])
     |> order_by(asc: :priority, asc: :scheduled_at, asc: :id)
     |> limit(^max(limit, 0))
     |> lock("FOR UPDATE SKIP LOCKED")
-    |> select([:id])
   end
 
   defp fetch_subquery(producer, limiter, limit, demands) do
@@ -593,27 +581,24 @@ defmodule Oban.Pro.Queue.SmartEngine do
       partition_by = partition_by_fields(partition)
       order_by = [asc: :priority, asc: :scheduled_at, asc: :id]
 
-      from_query =
-        Job
-        |> where(state: "available", queue: ^producer.queue)
-        |> order_by(^order_by)
-        |> limit(^max(limit * 10, 100))
-
       partitioned_query =
-        from_query
+        Job
         |> select([j], %{id: j.id, priority: j.priority, scheduled_at: j.scheduled_at})
         |> select_merge([j], %{worker: j.worker, args: j.args})
         |> select_merge([j], %{rank: over(dense_rank(), :partition)})
         |> windows([j], partition: [partition_by: ^partition_by, order_by: ^order_by])
+        |> where(state: "available", queue: ^producer.queue)
+        |> order_by(^order_by)
+        |> limit(^max(limit * 10, 100))
 
       conditions = demands_to_conditions(demands, limiter)
 
       partitioned_query
       |> subquery()
+      |> select([:id])
       |> where(^conditions)
       |> order_by(^order_by)
       |> limit(^max(limit, 0))
-      |> select([:id])
     end
   end
 
@@ -699,6 +684,8 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   defp track_jobs(_repo, %{conf: conf, jobs: jobs, producer: producer}) do
+    %{refresh_interval: interval, uuid: uuid} = producer
+
     meta =
       producer.meta
       |> Rate.track(jobs)
@@ -706,19 +693,21 @@ defmodule Oban.Pro.Queue.SmartEngine do
 
     query =
       Producer
-      |> where([p], p.uuid == ^producer.uuid)
+      |> where([p], p.uuid == ^uuid)
       |> select([p], p)
-      |> update([p],
-        set: [
-          updated_at: ^utc_now(),
-          meta: ^meta,
-          running_ids: fragment("? || ?", p.running_ids, ^Enum.map(jobs, & &1.id))
-        ]
-      )
+      |> update([p], set: [updated_at: ^utc_now(), meta: ^meta])
 
-    {1, [new_producer]} = Repo.update_all(conf, query, [])
+    case Repo.update_all(conf, query, []) do
+      {1, [producer]} ->
+        {:ok, %{producer | refresh_interval: interval}}
 
-    {:ok, %{new_producer | refresh_interval: producer.refresh_interval}}
+      {0, _} ->
+        # In this case the producer was erroneously deleted, possibly due to a connection error,
+        # downtime, or in development after waking from sleep.
+        %{producer | meta: meta, updated_at: utc_now()}
+        |> Changeset.change()
+        |> then(&Repo.insert(conf, &1))
+    end
   end
 
   defp ack_job(_repo, %{conf: conf, job: job}) do
@@ -728,44 +717,31 @@ defmodule Oban.Pro.Queue.SmartEngine do
   end
 
   defp ack_job(conf, producer, job) do
-    query =
+    with %{meta: %{global_limit: %{partition: partition}}} <- producer do
+      {key, _worker, _args} = Global.job_to_key(job, partition)
+
       Producer
       |> where([p], p.uuid == ^producer.uuid)
-      |> update([p], pull: [running_ids: ^job.id])
-
-    query =
-      case producer do
-        %{meta: %{global_limit: %{partition: partition}}} ->
-          {key, _worker, _args} = Global.job_to_key(job, partition)
-
-          update(query, [p], set: [meta: dec_tracked_count(p.meta, ^key)])
-
-        _ ->
-          query
-      end
-
-    Repo.update_all(conf, query, [])
+      |> update([p], set: [meta: dec_tracked_count(p.meta, ^key)])
+      |> then(&Repo.update_all(conf, &1, []))
+    end
 
     {:ok, nil}
   end
 
   defp ack_cancelled_jobs(_repo, %{conf: conf, jobs: {_count, jobs}}) do
-    producers =
-      jobs
-      |> Enum.group_by(& &1.queue)
-      |> Map.new(fn {queue, [job | _]} -> {queue, get_producer(conf, job)} end)
-
-    Enum.each(jobs, fn job ->
-      case Map.fetch!(producers, job.queue) do
-        %Producer{} = producer -> ack_job(conf, producer, job)
-        _ -> :ok
-      end
+    jobs
+    |> Enum.filter(&(&1.state == "executing"))
+    |> Enum.group_by(& &1.queue)
+    |> Enum.map(fn {_queue, [job | _] = jobs} -> {get_producer(conf, job), jobs} end)
+    |> Enum.each(fn {producer, jobs} ->
+      for job <- jobs, do: ack_job(conf, producer, job)
     end)
 
     {:ok, nil}
   end
 
-  defp oper_opts(%{log: log, prefix: prefix}), do: [log: log, prefix: prefix]
+  defp oper_opts(conf), do: Repo.default_options(conf)
 
   defp transaction(multi, conf, opts \\ []) do
     {:ok, _changes} = Repo.transaction(conf, multi, opts)
@@ -791,7 +767,7 @@ defmodule Oban.Pro.Queue.SmartEngine do
   defp find_uniq_dupes(_repo, %{uniques: []}), do: {:ok, MapSet.new()}
 
   defp find_uniq_dupes(_repo, %{conf: conf, opts: opts, uniques: uniques}) do
-    empty_query = from j in Job, select: [0, 0], where: false
+    empty_query = from j in Job, select: [0, 0, "available"], where: false
 
     dupes_query =
       Enum.reduce(uniques, empty_query, fn changeset, acc ->
@@ -800,7 +776,7 @@ defmodule Oban.Pro.Queue.SmartEngine do
 
         query =
           Job
-          |> select([j], [^uniq_key, j.id])
+          |> select([j], [^uniq_key, j.id, j.state])
           |> where(^uniq_conditions)
 
         union(acc, ^query)
@@ -809,7 +785,7 @@ defmodule Oban.Pro.Queue.SmartEngine do
     dupe_map =
       conf
       |> Repo.all(dupes_query, Keyword.put(opts, :prepare, :unnamed))
-      |> Map.new(fn [key, id] -> {key, id} end)
+      |> Map.new(fn [key, id, state] -> {key, {id, state}} end)
 
     {:ok, dupe_map}
   end
@@ -913,29 +889,35 @@ defmodule Oban.Pro.Queue.SmartEngine do
          not MapSet.member?(xact_set, uniq_key))
   end
 
+  defp not_dupe?(_changeset, _changes), do: true
+
   defp apply_replacements(_repo, %{uniques: []}), do: {:ok, []}
 
   defp apply_replacements(_repo, %{conf: conf, dupe_map: dupe_map, opts: opts, uniques: uniques}) do
-    updated =
-      uniques
-      |> Enum.filter(&get_in(&1.changes, [:replace]))
-      |> Enum.reduce(%{}, fn %{changes: changes}, acc ->
-        uniq_key = get_in(changes, [:meta, :uniq_key])
-        job_id = Map.get(dupe_map, uniq_key)
+    updates =
+      for %{changes: %{replace: replace} = changes} <- uniques,
+          is_map_key(dupe_map, changes.meta.uniq_key),
+          reduce: %{} do
+        acc ->
+          {job_id, job_state} = Map.get(dupe_map, changes.meta.uniq_key)
 
-        changes
-        |> Map.take(changes.replace)
-        |> Enum.reduce(acc, fn {key, val}, sub_acc ->
-          Map.update(sub_acc, {key, val}, [job_id], &[job_id | &1])
-        end)
-      end)
-      |> Enum.map(fn {val, ids} ->
-        conf
-        |> Repo.update_all(where(Job, [j], j.id in ^ids), [set: [val]], opts)
-        |> elem(0)
-      end)
+          job_state = String.to_existing_atom(job_state)
+          rep_keys = Keyword.get(replace, job_state, [])
 
-    {:ok, Enum.sum(updated)}
+          changes
+          |> Map.take(rep_keys)
+          |> Enum.reduce(acc, fn {key, val}, sub_acc ->
+            Map.update(sub_acc, {key, val}, [job_id], &[job_id | &1])
+          end)
+      end
+
+    Enum.each(updates, fn {val, ids} ->
+      conf
+      |> Repo.update_all(where(Job, [j], j.id in ^ids), [set: [val]], opts)
+      |> elem(0)
+    end)
+
+    {:ok, []}
   end
 
   defp apply_conflicts(_repo, %{new_jobs: jobs, uniques: []}), do: {:ok, jobs}
@@ -959,7 +941,7 @@ defmodule Oban.Pro.Queue.SmartEngine do
       end)
 
     dupes =
-      Enum.map(dupe_map, fn {uniq_key, job_id} ->
+      Enum.map(dupe_map, fn {uniq_key, {job_id, _job_state}} ->
         lookup
         |> Map.fetch!(uniq_key)
         |> Changeset.apply_action!(:insert)
@@ -973,14 +955,6 @@ defmodule Oban.Pro.Queue.SmartEngine do
   # Format Helpers
 
   defp seconds_from_now(seconds), do: DateTime.add(utc_now(), seconds, :second)
-
-  defp format_blamed(%{unsaved_error: unsaved_error}) do
-    %{kind: kind, reason: error, stacktrace: stacktrace} = unsaved_error
-
-    {blamed, stacktrace} = Exception.blame(kind, error, stacktrace)
-
-    Exception.format(kind, blamed, stacktrace)
-  end
 
   # Stability
 

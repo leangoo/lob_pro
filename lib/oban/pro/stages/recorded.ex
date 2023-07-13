@@ -34,7 +34,7 @@ defmodule Oban.Pro.Stages.Recorded do
       encoded = Utils.encode64(return)
 
       if byte_size(encoded) <= conf.limit do
-        send(self(), {:record_meta, Map.put(job.meta, to_string(conf.to), encoded)})
+        Process.put(:oban_meta, Map.put(job.meta, to_string(conf.to), encoded))
 
         :ok
       else

@@ -1,5 +1,213 @@
 defmodule Oban.Pro.Plugins.DynamicQueues do
-  @moduledoc false
+  @moduledoc """
+  The `DynamicQueue` plugin extends Oban's basic queue management by persisting queue changes
+  across restarts, globally, across all connected nodes. It also boasts a declarative syntax for
+  specifying which nodes a queue will run on.
+
+  `DynamicQueues` are ideal for applications that dynamically start, stop, or modify queues at
+  runtime.
+
+  ## Installation
+
+  Before running the `DynamicQueues` plugin, you must run a migration to add the `oban_queues`
+  table to your database.
+
+  ```bash
+  mix ecto.gen.migration add_oban_queues
+  ```
+
+  Open the generated migration in your editor and delegate to the dynamic queues migration:
+
+  ```elixir
+  defmodule MyApp.Repo.Migrations.AddObanQueues do
+    use Ecto.Migration
+
+    defdelegate change, to: Oban.Pro.Migrations.DynamicQueues
+  end
+  ```
+
+  As with the base Oban tables, you can optionally provide a `prefix` to "namespace" the table
+  within your database. Here we specify a `"private"` prefix:
+
+  ```elixir
+  defmodule MyApp.Repo.Migrations.AddObanQueues do
+    use Ecto.Migration
+
+    def change, do: Oban.Pro.Migrations.DynamicQueues.change(prefix: "private")
+  end
+  ```
+
+  Run the migration to create the table:
+
+  ```bash
+  mix ecto.migrate
+  ```
+
+  Now you can use the `DynamicQueues` plugin and start scheduling periodic jobs!
+
+  ## Using and Configuring
+
+  To begin using `DynamicQueues`, add the module to your list of Oban plugins in `config.exs`:
+
+      config :my_app, Oban,
+        plugins: [Oban.Pro.Plugins.DynamicQueues]
+        ...
+
+  Without providing a list of queues the plugin doesn't have anything to run. The syntax for
+  specifying dynamic queues is identical to Oban's built-in `:queues` option, which means you can
+  copy them over:
+
+      plugins: [{
+        Oban.Pro.Plugins.DynamicQueues,
+        queues: [
+          default: 20,
+          mailers: [global_limit: 20],
+          events: [local_limit: 30, rate_limit: [allowed: 100, period: 60]]
+        ]
+      }]
+
+  > #### Prevent Queue Conflicts {: .warning}
+  >
+  > Be sure to either omit any top level `queues` configuration to prevent a conflict between
+  > basic and dynamic queues.
+
+  Now, when `DynamicQueues` initializes, it will persist all of the queues to the database and
+  start supervising them. The `queues` syntax is _nearly_ identical to Oban's standard queues,
+  with an important enhancement we'll look at shortly.
+
+  Each of the persisted queues are referenced globally, by all other connected Oban instances that
+  are running the `DynamicQueues` plugin. Changing the queue's name, pausing, scaling, or changing
+  any other options will automatically update queues across all nodes—and persist across restarts.
+
+  Persisted queues are referenced by name, so you can tweak a queue's options by changing the
+  definition within your config. For example, to bump the mailer's global limit up to `30`:
+
+      queues: [
+        mailers: [global_limit: 30],
+        ...
+      ]
+
+  That isn't especially interesting—after all, that's exactly how regular queues work! Dynamic
+  queues start to shine when you insert, update, or delete them _dynamically_, either through Oban
+  Web or your own application code. But first, let's look at how to limit where dynamic queues run.
+
+  ### Limiting Where Queues Run
+
+  Dynamic queues can be configured to run on a subset of available nodes. This is especially
+  useful when wish to restrict resource-intensive queues to only dedicated nodes. Restriction is
+  configured through the `only` option, which you use like this:
+
+      queues: [
+        basic: [local_limit: 10, only: {:node, :=~, "web|worker"}],
+        audio: [local_limit: 5, only: {:node, "worker.1"}],
+        video: [local_limit: 5, only: {:node, "worker.2"}],
+        learn: [local_limit: 5, only: {:sys_env, "EXLA", "CUDA"}],
+        store: [local_limit: 1, only: {:sys_env, "WAREHOUSE", true}]
+      ]
+
+  In this example we've defined five queues, with the following restrictions:
+
+  * `basic` — will run on a node named `web` or `worker`
+  * `audio` — will only run on a node named `worker.1`
+  * `video` — will only run on a node named `worker.2`
+  * `learn` — will run wherever `EXLA=CUDA` is an environment variable
+  * `store` — will run wherever `WAREHOUSE=true` is an environment variable
+
+  Here are the various match modes, operators, and allowed patterns:
+
+  #### Modes
+
+  * `:node` — matches the node name as set in your Oban config. By default, `node`
+    is the node's id in a cluster, the hostname outside a cluster, or a `DYNO`
+    variable on Heroku.
+  * `:sys_env` — matches a single system environment variable as retrieved by
+    `System.get_env/1`
+
+  #### Operators
+
+  * `:==` — compares the pattern and runtime value for _equality_ as strings. This
+    is the default operator if nothing is specified.
+  * `:!=` — compares the pattern and runtime value for _inequality_ as strings
+  * `:=~` — treats the pattern as a regex and matches it against a runtime value
+
+  #### Patterns
+
+  * `boolean` — either `true` or `false`, which is stringified before comparison
+  * `string` — either a literal pattern or a regular expression, depending on the
+    supplied operator
+
+  ### Deleting Persisted Queues
+
+  It is possible to delete a persisted queue during initialization by passing the `:delete`
+  option:
+
+      queues: [
+        some_old_queue: [delete: true],
+        ...
+      ]
+
+  Multiple queues can be deleted simultaneously, if necessary. Deleting queues is also idempotent;
+  nothing will happen if a matching queue can't be found.
+
+  In the next section we'll look at how to list, insert, update and delete queues dynamically at
+  runtime.
+
+  ## Runtime Updates
+
+  Dynamic queues are persisted to the database, making it easy to manipulate them directly through
+  CRUD operations, or indirectly with Oban's queue operations, i.e. `pause_queue/2`,
+  `scale_queue/2`.
+
+  Explicit queue options will be overwritten on restart, while omitted fields are retained. For
+  example, consider the following dynamic queue entry:
+
+      queues: [
+        default: [limit: 10],
+        ...
+      ]
+
+  Scaling that `default` queue up or down at runtime _wouldn't_ persist across a restart, because
+  the definition will overwrite the `limit`. However, pausing the queue or changing the
+  `global_limit` _would_ persist because they aren't included in the queue definition.
+
+      # pause, global_limit, etc. will persist, but limit won't
+      default: [limit: 10]
+
+      # pause will persist, but limit and global_limit won't
+      default: [limit: 10, global_limit: 20]
+
+      # neither limits nor pausing will persist
+      default: [limit: 10, global_limit: 20, paused: true]
+
+  See function documentation for `all/0`, `insert/1`, `update/2`, and `delete/1` for more
+  information about runtime updates.
+
+  ## Enabling Polling Mode
+
+  In environments with restricted connectivity (where PubSub doesn't work) you can still use
+  DynamicQueues at runtime through polling mode. The polling interval is entirely up to you, as
+  it's disabled by default.
+
+      config :my_app, Oban,
+        plugins: [{Oban.Pro.Plugins.DynamicQueues, interval: :timer.minutes(1)}]
+
+  With the interval above each DynamicQueues instance will wake up every minute, check the
+  database for changes, and start new queues.
+
+  ## Isolation and Namespacing
+
+  All DynamicQueues functions have an alternate clause that accepts an Oban instance name for the
+  first argument. This matches base `Oban` functions such as `Oban.pause_queue/2`, which allow you
+  to seamlessly work with multiple Oban instances and across multiple database prefixes. For
+  example, you can use `all/1` to list all queues for the instance named `ObanPrivate`:
+
+      queues = DynamicQueues.all(ObanPrivate)
+
+  Likewise, to insert a new queue using the configuration associated with the `ObanPrivate`
+  instance:
+
+      DynamicQueues.insert(ObanPrivate, private: limit: 10)
+  """
 
   @behaviour Oban.Plugin
 
@@ -10,13 +218,30 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
   alias Ecto.Multi
   alias Oban.Pro.Queue.SmartEngine
   alias Oban.Pro.{Queue, Utils}
-  alias Oban.Queue.Supervisor, as: QueueSupervisor
-  alias Oban.{Config, Notifier, Peer, Registry, Repo, Validation}
+  alias Oban.{Config, Midwife, Notifier, Peer, Registry, Repo, Validation}
 
+  @type period :: pos_integer() | {:seconds | :minutes | :hours | :days, pos_integer()}
+  @type partition :: [fields: [:worker | :args], keys: [atom()]]
+
+  @type operator :: :== | :!= | :=~
+  @type pattern :: boolean() | String.t()
+  @type sys_key :: String.t()
   @type oban_name :: term()
-  @type queue_name :: String.t() | atom()
-  @type queue_opts :: Keyword.t()
+
+  @type queue_name :: atom()
   @type queue_input :: [{queue_name(), pos_integer() | queue_opts()}]
+  @type queue_opts ::
+          {:local_limit, pos_integer()}
+          | {:global_limit, pos_integer()}
+          | {:only, only()}
+          | {:paused, boolean()}
+          | {:rate_limit, [allowed: pos_integer(), period: period(), partition: partition()]}
+
+  @type only ::
+          {:node, pattern()}
+          | {:node, operator(), pattern()}
+          | {:sys_env, sys_key(), pattern()}
+          | {:sys_env, sys_key(), operator(), pattern()}
 
   defmodule State do
     @moduledoc false
@@ -45,10 +270,22 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
       {:name, _} -> :ok
       {:interval, interval} -> Validation.validate_timeout(:interval, interval)
       {:queues, queues} -> validate_queues(queues)
-      option -> {:error, "unknown option provided: #{inspect(option)}"}
+      option -> {:unknown, option, State}
     end)
   end
 
+  @doc """
+  Retrieve all persisted queues.
+
+  While it's possible to modify queue's returned from `all/0`, it is recommended that you use
+  `update/2` to ensure options are cast and validated correctly.
+
+  ## Examples
+
+  Retrieve a list of all queue schemas with persisted attributes:
+
+      DynamicQueues.all()
+  """
   @spec all(oban_name()) :: [Ecto.Schema.t()]
   def all(oban_name \\ Oban) do
     oban_name
@@ -56,7 +293,24 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
     |> all_queues()
   end
 
-  @spec insert(oban_name(), [queue_input()]) ::
+  @doc """
+  Persist a list of queue inputs, exactly like the `:queues` option passed as configuration.
+
+  Note that `insert/1` acts like an upsert, making it possible to modify queues if the name
+  matches. Still, it is better to use `update/2` to make targeted updates.
+
+  ## Examples
+
+  Insert a variety of queues with standard and advanced options:
+
+      DynamicQueues.insert(
+        basic: 10,
+        audio: [global_limit: 10],
+        video: [global_limit: 10],
+        learn: [local_limit: 5, only: {:node, :=~, "learn"}]
+      )
+  """
+  @spec insert(oban_name(), queue_input()) ::
           {:ok, [Ecto.Schema.t()]} | {:error, Ecto.Changeset.t()}
   def insert(oban_name \\ Oban, [_ | _] = entries) do
     conf = Oban.config(oban_name)
@@ -76,6 +330,34 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
     end
   end
 
+  @doc """
+  Modify a single queue's options.
+
+  Every option available when inserting queues can be updated.
+
+  ## Examples
+
+  The following call demonstrates updating every possible option:
+
+      DynamicQueues.update(
+        :video,
+        local_limit: 5,
+        global_limit: 20,
+        rate_limit: [allowed: 10, period: 30, partition: [fields: [:worker]]],
+        only: {:node, :=~, "media"},
+        paused: false
+      )
+
+  Updating a single option won't remove other persisted options. If you'd like to
+  clear an uption you must set them to `nil`:
+
+      DynamicQueues.update(:video, global_limit: nil)
+
+  Since `update/2` operates on a single queue, it is possible to rename a queue
+  without doing a `delete`/`insert` dance:
+
+      DynamicQueues.update(:video, name: :media)
+  """
   @spec update(oban_name(), queue_name(), queue_opts()) ::
           {:ok, Ecto.Schema.t()} | {:error, Ecto.Changeset.t()}
   def update(oban_name \\ Oban, name, opts) when is_name(name) do
@@ -110,6 +392,16 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
     Repo.update(conf, changeset)
   end
 
+  @doc """
+  Delete a queue by name at runtime, rather than using the `:delete` option into the `queues` list
+  in your configuration.
+
+  ## Examples
+
+  Delete ethe "audio" queue:
+
+      {:ok, _} = DynamicQueues.delete(:audio)
+  """
   @spec delete(oban_name(), queue_name()) :: {:ok, Ecto.Schema.t()} | {:error, Ecto.Changeset.t()}
   def delete(oban_name \\ Oban, name) when is_name(name) do
     conf = Oban.config(oban_name)
@@ -158,6 +450,12 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
     case payload do
       %{"action" => "scale", "ident" => "any", "queue" => queue_name} ->
         scale_queue(state.conf, queue_name, payload)
+
+      %{"action" => "pause", "ident" => "any", "queue" => queue_name} ->
+        scale_queue(state.conf, queue_name, %{"paused" => true})
+
+      %{"action" => "resume", "ident" => "any", "queue" => queue_name} ->
+        scale_queue(state.conf, queue_name, %{"paused" => false})
 
       %{"action" => "dyn_start", "queue" => queue_name} ->
         start_queue(state.conf, queue_name)
@@ -300,25 +598,14 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
 
   defp start_queue(conf, queue) do
     if run_locally?(conf, queue.only) do
-      spec = queue_spec(conf, queue)
-
-      conf.name
-      |> Registry.via()
-      |> Supervisor.start_child(spec)
+      Midwife.start_queue(conf, Queue.to_keyword_opts(queue))
     else
       :ignore
     end
   end
 
   defp stop_queue(conf, queue_name) when is_binary(queue_name) do
-    %{id: child_id} = queue_spec(conf, %{name: queue_name, opts: %{}})
-
-    Supervisor.terminate_child(Registry.via(conf.name), child_id)
-    Supervisor.delete_child(Registry.via(conf.name), child_id)
-  end
-
-  defp queue_spec(conf, queue) do
-    QueueSupervisor.child_spec({queue.name, Queue.to_keyword_opts(queue)}, conf)
+    Midwife.stop_queue(conf, queue_name)
   end
 
   defp run_locally?(%{node: node}, %{mode: :node, op: op, value: value}) do

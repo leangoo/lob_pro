@@ -168,7 +168,7 @@ defmodule Oban.Pro.Testing do
     engine: Oban.Pro.Queue.SmartEngine,
     notifier: Oban.Notifiers.PG,
     peer: Oban.Pro.Testing.Peer,
-    poll_interval: :infinity,
+    stage_interval: :infinity,
     shutdown_grace_period: 250
   ]
 
@@ -313,7 +313,7 @@ defmodule Oban.Pro.Testing do
       |> Keyword.merge(conf_opts)
       |> Config.new()
 
-    with_limit = if opts[:with_recursion], do: 1, else: 999_999_999
+    with_limit = if Keyword.get(opts, :with_recursion, true), do: 1, else: 999_999
 
     opts =
       opts
@@ -470,12 +470,7 @@ defmodule Oban.Pro.Testing do
   @doc since: "0.11.0"
   @spec run_chunk([Job.changeset()], [drain_option()]) :: drain_result()
   def run_chunk([_ | _] = chunk, opts) when is_list(opts) do
-    changesets =
-      Enum.map(chunk, fn changeset ->
-        Changeset.update_change(changeset, :meta, &Map.put(&1, :chunk_timeout, 0))
-      end)
-
-    run_jobs(changesets, Keyword.put_new(opts, :with_limit, 1))
+    run_jobs(chunk, Keyword.put_new(opts, :with_limit, 1))
   end
 
   @doc """
@@ -558,9 +553,6 @@ defmodule Oban.Pro.Testing do
       opts
       |> Keyword.take([:waiting_limit, :waiting_delay, :waiting_snooze])
       |> Map.new()
-      |> Map.put_new(:waiting_limit, 1)
-      |> Map.put_new(:waiting_delay, 1)
-      |> Map.put_new(:waiting_snooze, 1)
 
     changesets =
       Enum.map(changesets, fn changeset ->
@@ -584,8 +576,8 @@ defmodule Oban.Pro.Testing do
 
   ## Running Jobs
 
-  By default, the supervised instance won't process any jobs because the `poll_interval` is set to
-  `:infinity`. Set the `poll_interval` to a low value to process jobs normally, without manual
+  By default, the supervised instance won't process any jobs because the `stage_interval` is set
+  to `:infinity`. Set the `stage_interval` to a low value to process jobs normally, without manual
   draining.
 
   ## Options
@@ -602,7 +594,7 @@ defmodule Oban.Pro.Testing do
 
   Start the supervisor with a single queue and polling every 10ms:
 
-      start_supervised_oban!(repo: MyApp.Repo, poll_interval: 10, queues: [alpha: 10])
+      start_supervised_oban!(repo: MyApp.Repo, stage_interval: 10, queues: [alpha: 10])
   """
   @doc since: "0.11.0"
   @spec start_supervised_oban!([Oban.option()]) :: Registry.key()
@@ -679,7 +671,9 @@ defmodule Oban.Pro.Testing do
     case fetch_available(conf, opts) do
       [_ | _] = jobs ->
         executed =
-          Enum.map(jobs, fn job ->
+          jobs
+          |> streamline_pro_workers()
+          |> Enum.map(fn job ->
             conf
             |> Executor.new(job, safe: opts.with_safety)
             |> Executor.call()
@@ -694,6 +688,35 @@ defmodule Oban.Pro.Testing do
       [] ->
         complete_drain(conf, acc, opts)
     end
+  end
+
+  defp streamline_pro_workers(jobs) do
+    Enum.map(jobs, fn %{meta: meta} = job ->
+      case meta do
+        %{"batch_id" => _} ->
+          %{job | meta: Map.put_new(meta, "batch_debounce", 1)}
+
+        %{"chunk_size" => _} ->
+          meta =
+            meta
+            |> Map.put("chunk_sleep", 1)
+            |> Map.put("chunk_timeout", 0)
+
+          %{job | meta: meta}
+
+        %{"workflow_id" => _} ->
+          meta =
+            meta
+            |> Map.put_new("waiting_delay", 1)
+            |> Map.put_new("waiting_limit", 1)
+            |> Map.put_new("waiting_snooze", 1)
+
+          %{job | meta: meta}
+
+        _ ->
+          job
+      end
+    end)
   end
 
   defp stage_scheduled(conf) do

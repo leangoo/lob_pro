@@ -1,3 +1,5 @@
+require Protocol
+
 defmodule Oban.Pro.Producer do
   @moduledoc false
 
@@ -14,7 +16,6 @@ defmodule Oban.Pro.Producer do
           node: binary(),
           queue: binary(),
           meta: map(),
-          running_ids: [pos_integer()],
           started_at: DateTime.t(),
           updated_at: DateTime.t()
         }
@@ -24,7 +25,6 @@ defmodule Oban.Pro.Producer do
     field :name, :string
     field :node, :string
     field :queue, :string
-    field :running_ids, {:array, :integer}, default: []
     field :refresh_interval, :integer, virtual: true, default: :timer.seconds(30)
     field :started_at, :utc_datetime_usec
     field :updated_at, :utc_datetime_usec
@@ -110,6 +110,7 @@ defmodule Oban.Pro.Producer do
       |> Map.delete(:limit)
       |> Map.put_new_lazy(:local_limit, fn -> default_local_limit(params, schema) end)
 
+    # NOTE: Switch to `replace_lazy/3` when we require Elixir 1.14+
     params =
       if Map.get(params, :global_limit) do
         Map.update!(params, :global_limit, &cast_global_limit/1)
@@ -285,3 +286,9 @@ defmodule Oban.Pro.Producer do
     |> String.trim_leading("Elixir.")
   end
 end
+
+Protocol.derive(Jason.Encoder, Oban.Pro.Producer, except: [:__meta__])
+Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.GlobalLimit)
+Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.GlobalLimit.Partition)
+Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.RateLimit)
+Protocol.derive(Jason.Encoder, Oban.Pro.Producer.Meta.RateLimit.Partition)

@@ -271,9 +271,9 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
 
   The `DynamicPruner` plugin adds the following metadata to the `[:oban, :plugin, :stop]` event:
 
-  * `:pruned_count` - the total jobs that were pruned
+  * `:pruned_jobs` - the jobs that were deleted from the database
 
-  See the docs on [Plugin Events](Oban.Telemetry.html#module-plugin-events) for details.
+  _Note: jobs only include `id`, `queue`, and `state` fields._
   """
 
   @behaviour Oban.Plugin
@@ -315,6 +315,12 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
 
   @type override :: state_override() | queue_override() | worker_override()
 
+  @type option ::
+          {:conf, Oban.Config.t()}
+          | {:after, timeout()}
+          | {:interval, pos_integer()}
+          | {:name, Oban.name()}
+
   @modes [:max_age, :max_len]
   @states [:completed, :cancelled, :discarded]
   @time_units [
@@ -351,6 +357,9 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
     ]
   end
 
+  @doc false
+  def child_spec(args), do: super(args)
+
   @impl Oban.Plugin
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: opts[:name])
@@ -370,7 +379,7 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
       {:timeout, timeout} -> Validation.validate_integer(:timeout, timeout)
       {:timezone, timezone} -> Validation.validate_timezone(:timezone, timezone)
       {:worker_overrides, overrides} -> validate_overrides(:worker_overrides, overrides)
-      option -> {:error, "unknown option provided: #{inspect(option)}"}
+      option -> {:unknown, option, State}
     end)
   end
 
@@ -410,13 +419,7 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
     meta = %{conf: state.conf, plugin: __MODULE__}
 
     :telemetry.span([:oban, :plugin], meta, fn ->
-      case prune_jobs(state) do
-        {:ok, count} when is_integer(count) ->
-          {:ok, Map.put(meta, :pruned_count, count)}
-
-        error ->
-          {:error, Map.put(meta, :error, error)}
-      end
+      with {:ok, extra} <- prune_jobs(state), do: {:ok, Map.merge(meta, extra)}
     end)
 
     {:noreply, schedule_prune(state)}
@@ -436,41 +439,39 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
     {:ok, datetime} = DateTime.now(state.timezone)
 
     if Peer.leader?(state.conf) and Expression.now?(state.schedule, datetime) do
-      Repo.transaction(state.conf, fn ->
-        queue_counts =
-          for {queue, mode} <- state.queue_overrides do
-            Job
-            |> query_for_queues(:any, [to_string(queue)])
-            |> delete_for_mode(mode, state)
-          end
-
-        state_counts =
-          for {queue_state, mode} <- state.state_overrides do
-            Job
-            |> query_for_states(:any, [to_string(queue_state)])
-            |> delete_for_mode(mode, state)
-          end
-
-        worker_counts =
-          for {worker, mode} <- state.worker_overrides do
-            Job
-            |> query_for_workers(:any, [to_string(worker)])
-            |> delete_for_mode(mode, state)
-          end
-
-        default_count =
+      queue_pruned =
+        for {queue, mode} <- state.queue_overrides do
           Job
-          |> query_for_queues(:not, string_keys(state.queue_overrides))
-          |> query_for_states(:not, string_keys(state.state_overrides))
-          |> query_for_workers(:not, string_keys(state.worker_overrides))
-          |> delete_for_mode(state.mode, state)
+          |> query_for_queues(:any, [to_string(queue)])
+          |> delete_for_mode(mode, state)
+        end
 
-        [queue_counts, state_counts, worker_counts]
-        |> List.flatten()
-        |> Enum.reduce(default_count, &(&1 + &2))
-      end)
+      state_pruned =
+        for {queue_state, mode} <- state.state_overrides do
+          Job
+          |> query_for_states(:any, [to_string(queue_state)])
+          |> delete_for_mode(mode, state)
+        end
+
+      worker_pruned =
+        for {worker, mode} <- state.worker_overrides do
+          Job
+          |> query_for_workers(:any, [to_string(worker)])
+          |> delete_for_mode(mode, state)
+        end
+
+      default_pruned =
+        Job
+        |> query_for_queues(:not, string_keys(state.queue_overrides))
+        |> query_for_states(:not, string_keys(state.state_overrides))
+        |> query_for_workers(:not, string_keys(state.worker_overrides))
+        |> delete_for_mode(state.mode, state)
+
+      pruned = List.flatten([queue_pruned, state_pruned, worker_pruned, default_pruned])
+
+      {:ok, %{pruned_count: length(pruned), pruned_jobs: pruned}}
     else
-      {:ok, 0}
+      {:ok, %{pruned_count: 0, pruned_jobs: []}}
     end
   end
 
@@ -490,20 +491,26 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
   defp query_for_workers(query, :not, workers), do: where(query, [j], j.worker not in ^workers)
   defp query_for_workers(query, :any, workers), do: where(query, [j], j.worker in ^workers)
 
-  defp delete_for_mode(_query, {_mode, :infinity}, _state), do: 0
+  defp delete_for_mode(_query, {_mode, :infinity}, _state), do: []
 
   defp delete_for_mode(query, {:max_age, age}, state) do
     time = to_timestamp(age)
 
     query
     |> where([j], j.attempted_at < ^time or j.cancelled_at < ^time or j.discarded_at < ^time)
-    |> select([j], %{id: j.id, rn: 100_000_000})
+    |> select([j], %{id: j.id, queue: j.queue, state: j.state, worker: j.worker, rn: 100_000_000})
     |> delete_all(state.limit + 1, state)
   end
 
   defp delete_for_mode(query, {:max_len, len}, state) do
     query
-    |> select([j], %{id: j.id, rn: fragment("row_number() over (order by id desc)")})
+    |> select([j], %{
+      id: j.id,
+      queue: j.queue,
+      state: j.state,
+      worker: j.worker,
+      rn: fragment("row_number() over (order by id desc)")
+    })
     |> delete_all(len, state)
   end
 
@@ -512,28 +519,32 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
 
     subquery =
       query
-      |> where([j], j.state in ["completed", "cancelled", "discarded"])
+      |> where([j], j.state in ["cancelled", "completed", "discarded"])
       |> order_by(asc: :id)
       |> limit(^state.limit)
 
     query =
-      join(Job, :inner, [j], x in subquery(subquery, prefix: prefix),
-        on: j.id == x.id and x.rn > ^offset
-      )
+      Job
+      |> join(:inner, [j], x in subquery(subquery), on: j.id == x.id and x.rn > ^offset)
+      |> select([_, x], map(x, [:id, :queue, :state]))
 
     multi =
       Multi.new()
       |> Multi.run(:callback, &apply_before_delete(&1, &2, query, state))
-      |> Multi.delete_all(:deleted, query, log: log, prefix: prefix)
+      |> Multi.delete_all(:deleted, query, log: log, prefix: prefix, timeout: state.timeout)
 
-    {:ok, %{deleted: {count, _}}} = Repo.transaction(state.conf, multi, timeout: state.timeout)
+    {:ok, %{deleted: {_count, deleted}}} =
+      Repo.transaction(state.conf, multi, timeout: state.timeout)
 
-    count
+    deleted
   end
 
   defp apply_before_delete(_repo, _changes, query, state) do
     with {mod, fun, args} <- state.before_delete do
-      ids = Repo.all(state.conf, select(query, [j], j.id))
+      ids =
+        state.conf
+        |> Repo.all(query)
+        |> Enum.map(& &1.id)
 
       apply(mod, fun, [ids | args])
     end

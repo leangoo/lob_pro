@@ -3,7 +3,7 @@ defmodule Oban.Pro.Application do
 
   use Application
 
-  @handlers [Oban.Pro.Relay, Oban.Pro.Worker, Oban.Pro.Workers.Batch]
+  @handlers [Oban.Pro.Batcher, Oban.Pro.Relay, Oban.Pro.Worker]
 
   @impl Application
   def start(_type, _args) do

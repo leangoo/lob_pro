@@ -72,12 +72,18 @@ defmodule Oban.Pro.Utils do
   @spec to_exception(Changeset.t()) :: Exception.t()
   def to_exception(changeset) do
     changeset
-    |> Changeset.traverse_errors(&translate_errors/1)
-    |> Enum.map(&extract_errors/1)
-    |> List.flatten()
+    |> to_translated_errors()
     |> Enum.reverse()
     |> Enum.map(fn {field, message} -> ArgumentError.exception("#{field} #{message}") end)
     |> List.first()
+  end
+
+  @spec to_translated_errors(Changeset.t()) :: Keyword.t()
+  def to_translated_errors(changeset) do
+    changeset
+    |> Changeset.traverse_errors(&translate_errors/1)
+    |> Enum.map(&extract_errors/1)
+    |> List.flatten()
   end
 
   ## Conversions

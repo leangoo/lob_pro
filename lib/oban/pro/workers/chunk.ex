@@ -27,16 +27,72 @@ defmodule Oban.Pro.Workers.Chunk do
   ```
 
   Notice that we declared a `size` and a `timeout` along with a `queue` for the worker. If `size`
-  or `timeout` are omitted they fall back to their defaults: 100 for `size` and 1000ms for
-  `timeout`. To process larger batches less frequently, we can increase both values:
+  or `timeout` are omitted they fall back to their defaults: 100 `size` and 1000ms respectively.
 
-      use Oban.Pro.Workers.Chunk, size: 500, timeout: :timer.seconds(5)
+  To process _larger_ batches _less_ frequently, we can increase both values:
+
+  ```elixir
+  use Oban.Pro.Workers.Chunk, size: 500, timeout: :timer.seconds(5)
+  ```
 
   Now chunks will run with up to 500 jobs or every 5 seconds, whichever comes first.
 
-  Like other Pro workers, you define a `process/1` callback rather than `perform/1`. The `Chunk`
-  worker's `process/1` is a little different, as it receives a list of jobs rather than a single
-  struct. Fittingly, the [expected return values](#t:result/0) are different as well.
+  Unlike other Pro workers, a `Chunk` worker's `process/1` receives a list of jobs rather than a
+  single job struct. Fittingly, the [expected return values](#t:result/0) are different as well.
+
+  ## Chunk Partitioning
+
+  By default, chunks are divided into groups based on the `queue` and `worker`. This means that
+  each chunk consists of workers belonging to the same queue, regardless of their `args` or
+  `meta`. However, this approach may not always be suitable. For instance, you may want to group
+  workers based on a specific argument such as `:account_id` instead of just the worker. In such
+  cases, you can use the [`:by`](#t:chunk_by/0) option to customize how chunks are partitioned.
+
+  Here are a few examples of the `:by` option that you can use to achieve fine-grained control over
+  chunk partitioning:
+
+  ```elixir
+  # Explicitly chunk by :worker
+  use Oban.Pro.Workers.Chunk, by: :worker
+
+  # Chunk by a single args key without considering the worker
+  use Oban.Pro.Workers.Chunk, by: [args: :account_id]
+
+  # Chunk by multiple args keys without considering the worker
+  use Oban.Pro.Workers.Chunk, by: [args: [:account_id, :cohort]]
+
+  # Chunk by worker and a single args key
+  use Oban.Pro.Workers.Chunk, by: [:worker, args: :account_id]
+
+  # Chunk by a single meta key
+  use Oban.Pro.Workers.Chunk, by: [meta: :source_id]
+  ```
+
+  When partitioning chunks of jobs, it's important to note that using only `:args` or `:meta`
+  without `:worker` may result in heterogeneous chunks of jobs from different workers.
+  Nevertheless, regardless of the partitioning method chunks always consist of jobs from the same
+  queue.
+
+  Here's a simple example of partitioning by `worker` and an `author_id` field to batch analysis
+  of recent messages per author:
+
+  ```elixir
+  defmodule MyApp.LLMAnalysis do
+    use Oban.Pro.Workers.Chunk, by: [:worker, args: :author_id], size: 50, timeout: 30_000
+
+    @impl true
+    def process([%{"author_id" => author_id} | _] = jobs) do
+      messages =
+        jobs
+        |> Enum.map(& &1.args["message_id"])
+        |> MyApp.Messages.all()
+
+      {:ok, sentiment} = MyApp.GPT.gauge_sentiment(messages)
+
+      MyApp.Messages.record_sentiment(author_id)
+    end
+  end
+  ```
 
   ## Chunk Results and Error Handling
 
@@ -63,26 +119,28 @@ defmodule Oban.Pro.Workers.Chunk do
   We'll extend it to complete the whole batch when all messages are delivered or cancel
   undeliverable messages:
 
-      def process([_ | _] = jobs) do
-        notifications =
-          jobs
-          |> Enum.map(& &1.args)
-          |> MyApp.Messaging.send_batch()
+  ```elixir
+  def process([_ | _] = jobs) do
+    notifications =
+      jobs
+      |> Enum.map(& &1.args)
+      |> MyApp.Messaging.send_batch()
 
-        bad_token = fn %{response: response} -> response == :bad_token end
+    bad_token = fn %{response: response} -> response == :bad_token end
 
-        if Enum.any?(notifications, bad_token) do
-          cancels =
-            notifications
-            |> Enum.zip(jobs)
-            |> Enum.filter(fn {notification, _job} -> bad_token.(notification) end)
-            |> Enum.map(&elem(&1, 1))
+    if Enum.any?(notifications, bad_token) do
+      cancels =
+        notifications
+        |> Enum.zip(jobs)
+        |> Enum.filter(fn {notification, _job} -> bad_token.(notification) end)
+        |> Enum.map(&elem(&1, 1))
 
-          {:cancel, :bad_token, cancels}
-        else
-          {:ok, notifications}
-        end
-      end
+      {:cancel, :bad_token, cancels}
+    else
+      {:ok, notifications}
+    end
+  end
+  ```
 
   In the event of an ephemeral crash, like a network issue, the entire batch may be retried if
   there are any remaining attempts.
@@ -91,40 +149,63 @@ defmodule Oban.Pro.Workers.Chunk do
 
   Chunks are ran by a leader job (which has nothing to do with peer leadership). When the leader
   executes it determines whether a complete chunk is available or if enough time has elapsed to
-  run anyhow. If neither case applies then the leader will delay until the timeout elapsed and
+  run anyhow. If neither case applies, then the leader will delay until the timeout elapsed and
   execute with as many jobs as it can find.
 
-  Only the leader job may be cancelled as it is the only one tracked by a producer. Cancelling any
-  other jobs in the chunk won't stop the chunk from running.
+  Completion queries run every `1000ms` by default. You can use the `:sleep` option to control how
+  long the leader delays between queries to check for complete chunks:
+
+  ```elixir
+  use Oban.Pro.Workers.Chunk, size: 50, sleep: 2_000, timeout: 10_000
+  ```
+
+  Cancelling any jobs in a chunk will cancel the _entire_ chunk, including the leader job.
   """
 
-  import Ecto.Query, only: [limit: 2, order_by: 2, select: 3, where: 3]
+  import Ecto.Query
   import DateTime, only: [utc_now: 0]
 
   alias Ecto.Multi
-  alias Oban.{CrashError, Job, PerformError, Repo}
-  alias Oban.Engines.Basic
+  alias Oban.{CrashError, Job, Notifier, PerformError, Repo, Validation}
 
-  @type jobs :: [Job.t()]
-  @type reason :: term()
+  @type key_or_keys :: atom() | [atom()]
 
-  @type sub_result :: {reason(), jobs()}
+  @type chunk_by ::
+          :worker
+          | {:args, key_or_keys()}
+          | {:meta, key_or_keys()}
+          | [:worker | {:args, key_or_keys()} | {:meta, key_or_keys()}]
+
+  @type sub_result :: {reason :: term(), [Job.t()]}
 
   @type result ::
           :ok
           | {:ok, term()}
-          | {:cancel | :discard | :error, reason(), jobs()}
+          | {:cancel | :discard | :error, reason :: term(), [Job.t()]}
           | [cancel: sub_result(), discard: sub_result(), error: sub_result()]
 
-  defmacro __using__(opts) do
-    {chunk_opts, stand_opts} = Keyword.split(opts, [:size, :sleep, :timeout])
+  @type option ::
+          {:by, chunk_by()}
+          | {:size, pos_integer()}
+          | {:sleep, pos_integer()}
+          | {:timeout, pos_integer()}
 
-    quote location: :keep do
-      use Oban.Pro.Worker, unquote(stand_opts)
+  # Purely used for validation
+  defstruct [:by, :size, :sleep, :timeout]
+
+  @doc false
+  defmacro __using__(opts) do
+    {chunk_opts, other_opts} = Keyword.split(opts, [:by, :size, :sleep, :timeout])
+
+    quote do
+      Validation.validate!(unquote(chunk_opts), &Oban.Pro.Workers.Chunk.validate/1)
+
+      use Oban.Pro.Worker, unquote(other_opts)
 
       alias Oban.Pro.Workers.Chunk
 
       @default_meta %{
+        chunk_by: Keyword.get(unquote(chunk_opts), :by, :worker),
         chunk_size: Keyword.get(unquote(chunk_opts), :size, 100),
         chunk_sleep: Keyword.get(unquote(chunk_opts), :sleep, 1000),
         chunk_timeout: Keyword.get(unquote(chunk_opts), :timeout, 1000)
@@ -132,7 +213,19 @@ defmodule Oban.Pro.Workers.Chunk do
 
       @impl Oban.Worker
       def new(args, opts) when is_map(args) and is_list(opts) do
-        opts = Keyword.update(opts, :meta, @default_meta, &Map.merge(@default_meta, &1))
+        normalize_chunk_by = fn by ->
+          by
+          |> List.wrap()
+          |> Enum.map(fn
+            {key, val} -> [key, List.wrap(val)]
+            field -> field
+          end)
+        end
+
+        opts =
+          opts
+          |> Keyword.update(:meta, @default_meta, &Map.merge(@default_meta, &1))
+          |> update_in([:meta, :chunk_by], normalize_chunk_by)
 
         super(args, opts)
       end
@@ -148,6 +241,31 @@ defmodule Oban.Pro.Workers.Chunk do
         end
       end
     end
+  end
+
+  @doc false
+  def validate(opts) do
+    Validation.validate(opts, fn
+      {:by, by} -> validate_chunk_by(by)
+      {:size, size} -> Validation.validate_integer(:size, size)
+      {:sleep, sleep} -> Validation.validate_timeout(:sleep, sleep)
+      {:timeout, timeout} -> Validation.validate_timeout(:timeout, timeout)
+      option -> {:unknown, option, __MODULE__}
+    end)
+  end
+
+  defp validate_chunk_by(:worker), do: :ok
+  defp validate_chunk_by({:args, key}) when is_atom(key), do: :ok
+  defp validate_chunk_by({:meta, key}) when is_atom(key), do: :ok
+  defp validate_chunk_by({:args, [key | _]}) when is_atom(key), do: :ok
+  defp validate_chunk_by({:meta, [key | _]}) when is_atom(key), do: :ok
+  defp validate_chunk_by([:worker, {:args, key}]) when is_atom(key), do: :ok
+  defp validate_chunk_by([:worker, {:meta, key}]) when is_atom(key), do: :ok
+  defp validate_chunk_by([:worker, {:args, [key | _]}]) when is_atom(key), do: :ok
+  defp validate_chunk_by([:worker, {:meta, [key | _]}]) when is_atom(key), do: :ok
+
+  defp validate_chunk_by(fields) do
+    {:error, "expected :by to be :worker, an :args/:meta tuple, got: #{inspect(fields)}"}
   end
 
   # Public Interface
@@ -170,11 +288,71 @@ defmodule Oban.Pro.Workers.Chunk do
     end
   end
 
+  # Check Helpers
+
+  defp fetch_last_ts(conf, job) do
+    query =
+      Job
+      |> where([j], j.id != ^job.id)
+      |> where([j], j.state != "scheduled")
+      |> chunk_where(job)
+      |> order_by(desc: :id)
+      |> limit(1)
+      |> select(
+        [j],
+        type(
+          fragment(
+            "greatest(?, ?, ?, ?)",
+            j.attempted_at,
+            j.completed_at,
+            j.discarded_at,
+            j.cancelled_at
+          ),
+          :utc_datetime_usec
+        )
+      )
+
+    Repo.one(conf, query)
+  end
+
+  defp full_chunk?(conf, %{meta: %{"chunk_size" => size}} = job) do
+    limit = size - 1
+
+    query =
+      Job
+      |> select([j], j.id)
+      |> where([j], j.state == "available")
+      |> chunk_where(job)
+      |> limit(^limit)
+
+    Repo.one(conf, from(oj in subquery(query), select: count(oj.id) >= ^limit))
+  end
+
+  defp full_timeout?(nil, _job), do: false
+
+  defp full_timeout?(last_ts, %{meta: %{"chunk_timeout" => timeout}}) do
+    comp =
+      utc_now()
+      |> DateTime.add(-timeout, :millisecond)
+      |> DateTime.compare(last_ts)
+
+    comp == :gt
+  end
+
+  defp calculate_timeout(nil, %{meta: %{"chunk_timeout" => timeout}}), do: timeout
+
+  defp calculate_timeout(last_ts, %{meta: %{"chunk_timeout" => timeout}}) do
+    max(0, timeout - DateTime.diff(utc_now(), last_ts, :millisecond))
+  end
+
   # Processing Helpers
 
   defp fetch_and_process(conf, worker, %{meta: %{"chunk_size" => size}} = job) do
-    {:ok, meta} = Basic.init(conf, queue: job.queue, limit: size - 1)
-    {:ok, {_meta, chunk}} = Basic.fetch_jobs(conf, meta, %{})
+    {:ok, chunk} = fetch_chunk(conf, job, size - 1)
+    {chunk, _errored} = prepare_chunk(chunk)
+
+    guard_cancel(conf, Oban.whereis(conf.name), worker, job, chunk)
+    guard_timeout(conf, worker.timeout(job), worker, job, chunk)
 
     try do
       case worker.process([job | chunk]) do
@@ -211,6 +389,110 @@ defmodule Oban.Pro.Workers.Chunk do
     end
   end
 
+  # This replicates the query used in SmartEngine.fetch_jobs/3, without the meta tracking or any
+  # other complications. Any modifications to the original query must be replicated here. Another
+  defp fetch_chunk(conf, job, limit) do
+    subset_query =
+      Job
+      |> select([:id])
+      |> where(state: "available")
+      |> chunk_where(job)
+      |> order_by(asc: :priority, asc: :scheduled_at, asc: :id)
+      |> limit(^limit)
+      |> lock("FOR UPDATE SKIP LOCKED")
+
+    query =
+      Job
+      |> with_cte("subset", as: ^subset_query)
+      |> join(:inner, [j], x in fragment(~s("subset")), on: true)
+      |> where([j, x], j.id == x.id)
+      |> select([j, _], j)
+
+    attempted_by = job.attempted_by ++ ["chunk-#{job.id}"]
+
+    updates = [
+      set: [state: "executing", attempted_at: utc_now(), attempted_by: attempted_by],
+      inc: [attempt: 1]
+    ]
+
+    Repo.transaction(conf, fn ->
+      {_count, chunk} = Repo.update_all(conf, query, updates)
+
+      chunk
+    end)
+  end
+
+  defp prepare_chunk(chunk) do
+    Enum.reduce(chunk, {[], []}, fn job, {acc, err} ->
+      with {:ok, worker} <- Oban.Worker.from_string(job.worker),
+           {:ok, job} <- Oban.Pro.Worker.before_process(job, worker.__opts__()) do
+        {[job | acc], err}
+      else
+        {:error, reason} ->
+          {acc, [{job, reason} | err]}
+      end
+    end)
+  end
+
+  # Only the leader job is registered as "running" by the queue producer. We listen for pkill
+  # messages for _other_ jobs in the chunk and apply that to all jobs. Without this, cancelling
+  # doesn't apply to the leader and chunk jobs are orphaned.
+  #
+  # During tests there may not be an Oban instance and we can ignore cancelling.
+  defp guard_cancel(_conf, nil, _worker, _job, _chunk), do: :ok
+
+  defp guard_cancel(conf, pid, worker, job, chunk) when is_pid(pid) do
+    parent = self()
+
+    Task.start(fn ->
+      ref = Process.monitor(parent)
+      :ok = Notifier.listen(conf.name, [:signal])
+
+      await_cancel(conf, ref, worker, job, chunk)
+    end)
+  end
+
+  defp await_cancel(conf, ref, worker, job, chunk) do
+    receive do
+      {:notification, :signal, %{"action" => "pkill", "job_id" => kill_id}} ->
+        if Enum.any?(chunk, &(&1.id == kill_id)) do
+          reason = PerformError.exception({job.worker, {:cancel, :shutdown}})
+
+          ack_cancelled(conf, worker, job, chunk, chunk, reason)
+
+          Notifier.notify(conf.name, :signal, %{action: "pkill", job_id: job.id})
+        else
+          await_cancel(conf, ref, worker, job, chunk)
+        end
+
+      {:DOWN, ^ref, :process, _pid, _reason} ->
+        :ok
+    end
+  end
+
+  # The executor uses :timer.exit_after/2 to kill jobs that exceed the timeout. The queue's
+  # producer then catches the DOWN message and uses that to record a job error. The producer
+  # isn't aware of the job's chunk, so we monitor the parent process and ack the chunk jobs.
+  defp guard_timeout(_conf, :infinity, _worker, _job, _chunk), do: :ok
+
+  defp guard_timeout(conf, timeout, worker, job, chunk) do
+    parent = self()
+
+    Task.start(fn ->
+      ref = Process.monitor(parent)
+
+      receive do
+        {:DOWN, ^ref, :process, _pid, %Oban.TimeoutError{} = reason} ->
+          ack_errored(conf, worker, job, chunk, chunk, reason)
+
+        {:DOWN, ^ref, :process, _pid, _reason} ->
+          :ok
+      after
+        timeout + 100 -> :ok
+      end
+    end)
+  end
+
   defp sleep_and_process(timeout, %Job{conf: conf, meta: meta} = job, worker) do
     sleep = Map.get(meta, "chunk_sleep", 1000)
 
@@ -228,59 +510,30 @@ defmodule Oban.Pro.Workers.Chunk do
     end
   end
 
-  # Check Helpers
+  # Chunk Helpers
 
-  defp fetch_last_ts(conf, %{id: id, worker: worker}) do
-    query =
-      Job
-      |> where([j], j.worker == ^worker)
-      |> where([j], j.id != ^id)
-      |> where([j], j.state != "scheduled")
-      |> order_by(desc: :id)
-      |> limit(1)
-      |> select(
-        [j],
-        type(
-          fragment(
-            "greatest(?, ?, ?, ?)",
-            j.attempted_at,
-            j.completed_at,
-            j.discarded_at,
-            j.cancelled_at
-          ),
-          :utc_datetime_usec
-        )
-      )
+  defp chunk_where(query, job) do
+    query = where(query, queue: ^job.queue)
 
-    Repo.one(conf, query)
+    job.meta
+    |> Map.get("chunk_by")
+    |> Enum.reduce(query, fn
+      "worker", acc ->
+        where(acc, worker: ^job.worker)
+
+      ["args", keys], acc ->
+        where(acc, [j], fragment("? @> ?", j.args, ^take_keys(job.args, keys)))
+
+      ["meta", keys], acc ->
+        where(acc, [j], fragment("? @> ?", j.meta, ^take_keys(job.meta, keys)))
+    end)
   end
 
-  defp full_chunk?(conf, %{meta: %{"chunk_size" => size}, worker: worker}) do
-    query =
-      Job
-      |> where([j], j.worker == ^worker)
-      |> where([j], j.state == "available")
-      |> select([j], count(j.id) >= ^(size - 1))
-
-    Repo.one(conf, query)
+  defp take_keys(args, keys) when is_struct(args) do
+    Map.take(args, Enum.map(keys, &String.to_existing_atom/1))
   end
 
-  defp full_timeout?(nil, _job), do: false
-
-  defp full_timeout?(last_ts, %{meta: %{"chunk_timeout" => timeout}}) do
-    comp =
-      utc_now()
-      |> DateTime.add(-timeout, :millisecond)
-      |> DateTime.compare(last_ts)
-
-    comp == :gt
-  end
-
-  defp calculate_timeout(nil, %{meta: %{"chunk_timeout" => timeout}}), do: timeout
-
-  defp calculate_timeout(last_ts, %{meta: %{"chunk_timeout" => timeout}}) do
-    max(0, timeout - DateTime.diff(utc_now(), last_ts, :millisecond))
-  end
+  defp take_keys(map, keys), do: Map.take(map, keys)
 
   # Ack Helpers
 
@@ -293,10 +546,12 @@ defmodule Oban.Pro.Workers.Chunk do
   defp ack_raised(conf, worker, chunk, job, error, stacktrace) do
     {dis, ers} = Enum.split_with(chunk, &exhausted?/1)
 
+    opts = Repo.default_options(conf)
+
     multi =
       Multi.new()
-      |> Multi.update_all(:err, ids_query(ers), err_ups(worker, job, error, stacktrace))
-      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, error, stacktrace))
+      |> Multi.update_all(:err, ids_query(ers), err_ups(worker, job, error, stacktrace), opts)
+      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, error, stacktrace), opts)
 
     Repo.transaction(conf, multi)
 
@@ -307,11 +562,13 @@ defmodule Oban.Pro.Workers.Chunk do
     {ers, oks, set} = split_with_set(errored, chunk)
     {dis, ers} = Enum.split_with(ers, &exhausted?/1)
 
+    opts = Repo.default_options(conf)
+
     multi =
       Multi.new()
-      |> Multi.update_all(:com, ids_query(oks), com_ups())
-      |> Multi.update_all(:err, ids_query(ers), err_ups(worker, job, {:error, reason}))
-      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, {:error, reason}))
+      |> Multi.update_all(:com, ids_query(oks), com_ups(), opts)
+      |> Multi.update_all(:err, ids_query(ers), err_ups(worker, job, {:error, reason}), opts)
+      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, {:error, reason}), opts)
 
     with {:ok, _result} <- Repo.transaction(conf, multi) do
       if MapSet.member?(set, job.id), do: {:error, reason}, else: :ok
@@ -321,10 +578,12 @@ defmodule Oban.Pro.Workers.Chunk do
   defp ack_cancelled(conf, worker, job, chunk, cancelled, reason) do
     {can, oks, set} = split_with_set(cancelled, chunk)
 
+    opts = Repo.default_options(conf)
+
     multi =
       Multi.new()
-      |> Multi.update_all(:com, ids_query(oks), com_ups())
-      |> Multi.update_all(:can, ids_query(can), can_ups(worker, job, {:cancel, reason}))
+      |> Multi.update_all(:com, ids_query(oks), com_ups(), opts)
+      |> Multi.update_all(:can, ids_query(can), can_ups(worker, job, {:cancel, reason}), opts)
 
     with {:ok, _result} <- Repo.transaction(conf, multi) do
       if MapSet.member?(set, job.id), do: {:cancel, reason}, else: :ok
@@ -334,10 +593,12 @@ defmodule Oban.Pro.Workers.Chunk do
   defp ack_discarded(conf, worker, job, chunk, discarded, reason) do
     {dis, oks, set} = split_with_set(discarded, chunk)
 
+    opts = Repo.default_options(conf)
+
     multi =
       Multi.new()
-      |> Multi.update_all(:com, ids_query(oks), com_ups())
-      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, {:discard, reason}))
+      |> Multi.update_all(:com, ids_query(oks), com_ups(), opts)
+      |> Multi.update_all(:dis, ids_query(dis), dis_ups(worker, job, {:discard, reason}), opts)
 
     with {:ok, _result} <- Repo.transaction(conf, multi) do
       if MapSet.member?(set, job.id), do: {:discard, reason}, else: :ok
@@ -347,8 +608,10 @@ defmodule Oban.Pro.Workers.Chunk do
   defp ack_multiple(conf, worker, host, chunk, multiple) do
     {oks, result} = split_multiple_result(host, chunk, multiple)
 
+    opts = Repo.default_options(conf)
+
     group = fn {oper, reason, %{attempt: attempt}} -> {oper, reason, attempt} end
-    multi = Multi.update_all(Multi.new(), :com, ids_query(oks), com_ups())
+    multi = Multi.update_all(Multi.new(), :com, ids_query(oks), com_ups(), opts)
 
     multi =
       for({oper, {reas, jobs}} <- multiple, job <- jobs, job.id != host.id, do: {oper, reas, job})
@@ -363,7 +626,7 @@ defmodule Oban.Pro.Workers.Chunk do
             :error -> err_ups(worker, hd(jobs), {:error, reason})
           end
 
-        Multi.update_all(acc, {oper, index}, ids_query(jobs), update)
+        Multi.update_all(acc, {oper, index}, ids_query(jobs), update, opts)
       end)
 
     with {:ok, _} <- Repo.transaction(conf, multi), do: result

@@ -1,5 +1,222 @@
 defmodule Oban.Pro.Plugins.DynamicCron do
-  @moduledoc false
+  @moduledoc """
+  The `DynamicCron` plugin enhances Oban's cron scheduler by making it configurable at runtime,
+  globally, across your entire cluster. `DynamicCron` supports adding, updating, deleting, and
+  pausing cron entries at boot time _or_ runtime. It is an ideal solution for applications that
+  must dynamically start and manage scheduled tasks at runtime.
+
+  ## Installation
+
+  Before running the `DynamicCron` plugin you must run a migration to add the `oban_cron` table to
+  your database.
+
+  ```bash
+  mix ecto.gen.migration add_oban_cron
+  ```
+
+  Open the generated migration in your editor and add a call to the migration's `change/0`
+  function:
+
+  ```elixir
+  defmodule MyApp.Repo.Migrations.AddObanCron do
+    use Ecto.Migration
+
+    defdelegate change, to: Oban.Pro.Migrations.DynamicCron
+  end
+  ```
+
+  As with the base Oban tables you can optionally provide a `prefix` to "namespace" the table
+  within your database. Here we specify a `"private"` prefix:
+
+  ```elixir
+  defmodule MyApp.Repo.Migrations.AddObanCron do
+    use Ecto.Migration
+
+    def change, do: Oban.Pro.Migrations.DynamicCron.change(prefix: "private")
+  end
+  ```
+
+  Run the migration to create the table:
+
+  ```bash
+  mix ecto.migrate
+  ```
+
+  Now you can use the `DynamicCron` plugin and start scheduling periodic jobs!
+
+  ## Using and Configuring
+
+  To begin using `DynamicCron`, add the module to your list of Oban plugins in `config.exs`:
+
+  ```elixir
+  config :my_app, Oban,
+    plugins: [Oban.Pro.Plugins.DynamicCron]
+    ...
+  ```
+
+  By itself, without providing a crontab or dynamically inserting cron entries, the plugin doesn't
+  have anything to schedule. To get scheduling started, provide a list of `{cron, worker}` or
+  `{cron, worker, options}` tuples to the plugin. The syntax is identical to Oban's built in
+  `:crontab` option, which means you can copy an existing standard `:crontab` list into the
+  plugin's `:crontab`.
+
+  ```elixir
+  plugins: [{
+    Oban.Pro.Plugins.DynamicCron,
+    timezone: "America/Chicago",
+    crontab: [
+      {"* * * * *", MyApp.MinuteJob},
+      {"0 * * * *", MyApp.HourlyJob, queue: :scheduled},
+      {"0 0 * * *", MyApp.DailyJob, max_attempts: 1},
+      {"0 12 * * MON", MyApp.MondayWorker, tags: ["scheduled"]},
+      {"@daily", MyApp.AnotherDailyWorker}
+    ]
+  }]
+  ```
+
+  Now, when dynamic cron initializes, it will persist those cron entries to the database and start
+  scheduling them according to their CRON expression. The plugin's `crontab` format is nearly
+  identical to Oban's standard crontab, with a few important enhancements we'll look at soon.
+
+  Each of the crontab entries are persisted to the database and referenced globally, by all the
+  other connected Oban instances. That allows us to insert, update, or delete cron entries at any
+  time. In fact, changing the schedule or options of an entry in the crontab provided to the
+  plugin will automatically update the persisted entry. To demonstrate, let's modify the
+  `MinuteJob` we specified so that it runs every other minute in the `:scheduled` queue:
+
+  ```elixir
+  crontab: [
+    {"*/2 * * * *", MyApp.MinuteJob, queue: :scheduled},
+    ...
+  ]
+  ```
+
+  Now it isn't really a "minute job" any more, and the name is no longer suitable. However, we
+  didn't provide a name for the entry and it's using the module name instead. To provide more
+  flexibility we can add a `:name` overrride, then we can update the worker's name as well:
+
+  ```elixir
+  crontab: [
+    {"*/2 * * * *", MyApp.FrequentJob, name: "frequent", queue: :scheduled},
+    ...
+  ]
+  ```
+
+  All entries are referenced by name, which defaults to the worker's name and must be unique. You
+  may define the same worker multiple times _as long as_ you provide a name override:
+
+  ```elixir
+  crontab: [
+    {"*/3 * * * *", MyApp.BasicJob, name: "client-1", args: %{client_id: 1}},
+    {"*/3 * * * *", MyApp.BasicJob, name: "client-2", args: %{client_id: 2}},
+    ...
+  ]
+  ```
+
+  To temporarily disable scheduling jobs you can set the `paused` flag:
+
+
+  ```elixir
+  crontab: [
+    {"* * * * *", MyApp.BasicJob, paused: true},
+    ...
+  ]
+  ```
+
+  To resume the job you must supply `paused: false` (or use `update/2` to resume it manually),
+  simply removing the `paused` option will have no effect.
+
+  ```elixir
+  crontab: [
+    {"* * * * *", MyApp.BasicJob, paused: false},
+    ...
+  ]
+  ```
+
+  It is also possible to delete a persisted entry during initialization by passing the `:delete`
+  option:
+
+  ```elixir
+  crontab: [
+    {"* * * * *", MyApp.MinuteJob, delete: true},
+    ...
+  ]
+  ```
+
+  One or more entries can be deleted this way. Deleting entries is idempotent, nothing will happen
+  if no matching entry can be found.
+
+  In the next section we'll look at how to list, insert, update and delete jobs dynamically at
+  runtime.
+
+  ## Overriding the Timezone
+
+  Without any configuration the default timezone is `Etc/UTC`. You can override that for all cron
+  entries by passing a `timezone` option to the plugin:
+
+  ```elixir
+  plugins: [{
+    Oban.Pro.Plugins.DynamicCron,
+    timezone: "America/Chicago",
+    # ...
+  ```
+
+  You can also override the timezone for individual entries by passing it as an option to the
+  `crontab` list or to `DynamicCron.insert/1`:
+
+  ```elixir
+  DynamicCron.insert([
+    {"0 0 * * *", MyApp.Pinger, name: "oslo", timezone: "Europe/Oslo"},
+    {"0 0 * * *", MyApp.Pinger, name: "chicago", timezone: "America/Chicago"},
+    {"0 0 * * *", MyApp.Pinger, name: "zagreb", timezone: "Europe/Zagreb"}
+  ])
+  ```
+
+  ## Runtime Updates
+
+  Dynamic cron entries are persisted to the database, making it easy to manipulate them through
+  typical CRUD operations. The `DynamicCron` plugin provides convenience functions to simplify
+  working those operations.
+
+  The `insert/1` function takes a list of one or more tuples with the same `{expression, worker}`
+  or `{expression, worker, options}` format as the plugin's `crontab` option:
+
+  ```elixir
+  DynamicCron.insert([
+    {"0 0 * * *", MyApp.GenericWorker},
+    {"* * * * *", MyApp.ClientWorker, name: "client-1", args: %{client_id: 1}},
+    {"* * * * *", MyApp.ClientWorker, name: "client-2", args: %{client_id: 2}},
+    {"* * * * *", MyApp.ClientWorker, name: "client-3", args: %{client_id: 3}}
+  ])
+  ```
+
+  Be aware that `insert/1` acts like an "upsert", making it possible to modify existing entries if
+  the worker or name matches. Still, it is better to use `update/2` to make targeted updates.
+
+  ## Isolation and Namespacing
+
+  All `DynamicCron` functions have an alternate clause that accepts an Oban instance name as the
+  first argument. This is in line with base `Oban` functions such as `Oban.insert/2`, which allow
+  you to seamlessly work with multiple Oban instances and across multiple database prefixes. For
+  example, you can use `all/1` to list all cron entries for the instance named `ObanPrivate`:
+
+  ```elixir
+  entries = DynamicCron.all(ObanPrivate)
+  ```
+
+  Likewise, to insert a new entry using the configuration associated with the `ObanPrivate`
+  instance:
+
+  ```elixir
+  {:ok, _} = DynamicCron.insert(ObanPrivate, [{"* * * * *", PrivateWorker}])
+  ```
+
+  ## Instrumenting with Telemetry
+
+  The `DynamicCron` plugin adds the following metadata to the `[:oban, :plugin, :stop]` event:
+
+  * `:jobs` - a list of jobs that were inserted into the database
+  """
 
   @behaviour Oban.Plugin
 
@@ -27,6 +244,13 @@ defmodule Oban.Pro.Plugins.DynamicCron do
           | {:timezone, String.t()}
   @type cron_input :: {cron_expr(), module()} | {cron_expr(), module(), [cron_opt]}
 
+  @type option ::
+          {:conf, Oban.Config.t()}
+          | {:crontab, [cron_input()]}
+          | {:name, Oban.name()}
+          | {:timezone, Calendar.time_zone()}
+          | {:timeout, timeout()}
+
   @base_opts [unique: [period: 59]]
 
   defmodule State do
@@ -45,7 +269,11 @@ defmodule Oban.Pro.Plugins.DynamicCron do
 
   defguardp is_name(name) when is_binary(name) or (is_atom(name) and not is_nil(name))
 
+  @doc false
+  def child_spec(args), do: super(args)
+
   @impl Oban.Plugin
+  @spec start_link([option()]) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: opts[:name])
   end
@@ -58,10 +286,21 @@ defmodule Oban.Pro.Plugins.DynamicCron do
       {:name, _} -> :ok
       {:timezone, timezone} -> Validation.validate_timezone(:timezone, timezone)
       {:timeout, timeout} -> Validation.validate_integer(:timeout, timeout)
-      option -> {:error, "unknown option provided: #{inspect(option)}"}
+      option -> {:unknown, option, State}
     end)
   end
 
+  @doc """
+  Used to retrieve all persisted cron entries.
+
+  The `all/0` function is provided as a convenience to inspect persisted entries.
+
+  ## Examples
+
+  Return a list of cron schemas with raw attributes:
+
+      entries = DynamicCron.all()
+  """
   @spec all(term()) :: [Ecto.Schema.t()]
   def all(oban_name \\ Oban) do
     oban_name
@@ -69,6 +308,24 @@ defmodule Oban.Pro.Plugins.DynamicCron do
     |> list_cron()
   end
 
+  @doc """
+  Insert cron entries into the database to start scheduling new jobs.
+
+  Be aware that `insert/1` acts like an "upsert", making it possible to modify existing entries if
+  the worker or name matches. Still, it is better to use `update/2` to make targeted updates.
+
+  ## Examples
+
+  Insert a list of tuples with the same `{expression, worker}` or `{expression, worker, options}`
+  format as the plugin's `crontab` option.
+
+      DynamicCron.insert([
+        {"0 0 * * *", MyApp.GenericWorker},
+        {"* * * * *", MyApp.ClientWorker, name: "client-1", args: %{client_id: 1}},
+        {"* * * * *", MyApp.ClientWorker, name: "client-2", args: %{client_id: 2}},
+        {"* * * * *", MyApp.ClientWorker, name: "client-3", args: %{client_id: 3}}
+      ])
+  """
   @spec insert(term(), [cron_input()]) :: {:ok, [Ecto.Schema.t()]} | {:error, Ecto.Changeset.t()}
   def insert(oban_name \\ Oban, [_ | _] = crontab) do
     oban_name
@@ -83,6 +340,44 @@ defmodule Oban.Pro.Plugins.DynamicCron do
     end
   end
 
+  @doc """
+  Update a single cron entry, as identified by worker or name.
+
+  Any option available when specifying an entry in the `crontab` list or when calling `insert/2`
+  can be updated—that includes the cron `expression` and the `worker`.
+
+  ## Examples
+
+  The following call demonstrates updating every possible option:
+
+      {:ok, _} =
+        DynamicCron.update(
+          "cron-1",
+          expression: "1 * * * *",
+          max_attempts: 10,
+          name: "special-cron",
+          paused: false,
+          priority: 0,
+          queue: "dedicated",
+          tags: ["client", "scheduled"],
+          timezone: "Europe/Amsterdam",
+          worker: Other.Worker,
+        )
+
+  Naturally, individual options may be updated instead. For example, set `paused: true` to pause
+  an entry:
+
+      {:ok, _} = DynamicCron.update(MyApp.ClientWorker, paused: true)
+
+  Since `update/2` operates on a single entry at a time, it is possible to rename an entry without
+  doing a `delete`/`insert` dance:
+
+      {:ok, _} = DynamicCron.update(MyApp.ClientWorker, name: "client-worker")
+
+  Or, update an entry with a custom entry name already set:
+
+      {:ok, _} = DynamicCron.update("cron-1", name: "special-cron")
+  """
   @spec update(term(), cron_name(), [cron_opt()]) ::
           {:ok, Ecto.Schema.t()} | {:error, Ecto.Changeset.t()}
   def update(oban_name \\ Oban, name, opts) when is_name(name) do
@@ -91,6 +386,22 @@ defmodule Oban.Pro.Plugins.DynamicCron do
     |> update_cron(Worker.to_string(name), opts)
   end
 
+  @doc """
+  Delete individual entries, by worker or name.
+
+  Use `delete/1` to remove entries at runtime, rather than hard-coding the `:delete` flag into the
+  `crontab` list at compile time.
+
+  ## Examples
+
+  With the worker as the entry name:
+
+      {:ok, _} = DynamicCron.delete(Worker)
+
+  With a custom name:
+
+      {:ok, _} = DynamicCron.delete("cron-1")
+  """
   @spec delete(term(), cron_name()) :: {:ok, Ecto.Schema.t()} | {:error, Ecto.Changeset.t()}
   def delete(oban_name \\ Oban, name) when is_name(name) do
     oban_name
@@ -153,6 +464,10 @@ defmodule Oban.Pro.Plugins.DynamicCron do
         not Keyword.keyword?(opts) ->
           {:error, "options must be a keyword list, got: #{inspect(opts)}"}
 
+        not valid_entry?(opts) ->
+          {:error,
+           "expected cron options to be one of #{inspect(CronEntry.allowed_opts())}, got: #{inspect(opts)}"}
+
         not valid_job?(worker, opts) ->
           {:error, "expected valid job options, got: #{inspect(opts)}"}
 
@@ -170,6 +485,14 @@ defmodule Oban.Pro.Plugins.DynamicCron do
     {:error,
      "expected crontab entry to be an {expression, worker} or " <>
        "{expression, worker, options} tuple, got: #{inspect(invalid)}"}
+  end
+
+  defp valid_entry?(opts) do
+    string_keys = Enum.map(CronEntry.allowed_opts(), &to_string/1)
+
+    opts
+    |> Keyword.drop([:delete, :name, :paused])
+    |> Enum.all?(fn {key, _} -> to_string(key) in string_keys end)
   end
 
   defp valid_job?(worker, opts) do

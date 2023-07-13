@@ -34,29 +34,106 @@ defmodule Oban.Pro.Worker do
 
   ## Structured Jobs
 
-  Structured workers help you catch typos within your jobs by validating keys on insert and
-  enforcing keys during execution. They also automatically generate a struct for compile-time
-  checks and friendly dot access.
+  Structured workers help you catch invalid data within your jobs by validating args on insert and
+  casting args before execution. They also automatically generate structs for compile-time checks
+  and friendly dot access.
 
   #### Defining a Structured Worker
 
-  On a structured worker the `keys` and `required` options determine which keys are allowed at
-  all, and which are required. A notable benefit is that the args passed to `process/1` are
-  converted into a struct:
+  Structured workers use `args_schema/1` to define which fields are allowed, required, and their
+  expected types. Another benefit, aside from validation, is that args passed to `process/1` are
+  converted into a struct named after the worker module. Here's an example that demonstrates
+  defining a worker with several field types and embedded data structures:
 
-  ```elixir
-  defmodule MyApp.StructuredWorker do
-    use Oban.Pro.Worker, structured: [keys: [:a, :b, :c], required: [:a, :c]]
+      defmodule MyApp.StructuredWorker do
+        use Oban.Pro.Worker
 
-    @impl Oban.Pro.Worker
-    def process(%Job{args: %__MODULE__{a: a, c: c} = args}) do
-      # Use the matched keys or access them on args
-    end
-  end
-  ```
+        args_schema do
+          field :id, :id, required: true
+          field :name, :string, required: true
+          field :mode, :enum, values: ~w(enabled disabled paused)a
 
-  The `keys` option is mandatory, but `required` is optional. If you provide a list of `required`
-  keys they _must_ be a subset of the full `keys` list.
+          embeds_one :data, required: true do
+            field :office_id, :uuid, required: true
+            field :has_notes, :boolean
+            field :addons, {:array, :string}
+          end
+
+          embeds_many :addresses do
+            field :street, :string
+            field :city, :string
+            field :country, :string
+          end
+        end
+
+        @impl Oban.Pro.Worker
+        def process(%Job{args: %__MODULE__{id: id, name: name, mode: mode, data: data}}) do
+          %{office_id: office_id, notes: notes} = data
+
+          # Use the matched, cast values
+        end
+      end
+
+  The example's schema declares five top level keys, `:id`, `:name`, `:mode`, `:data`, and
+  `:addresses`. Of those, only `:id`, `:name`, and the `:office_id` subkey are marked required.
+  The `:mode` field is an enum that validates values and casts to an atom. The embedded `:data`
+  field declares a nested map with its own type coercion and validation, including a custom
+  `Ecto.UUID` type. Finally, `:addresses` specifies an embedded list of maps.
+
+  Job args are validated on `new/1` and errors bubble up to prevent insertion:
+
+      StructuredWorker.new(%{id: "not-an-id", mode: "unknown"}).valid?
+      # => false (invalid id, invalid mode, missing name)
+
+      StructuredWorker.new(%{id: "123", mode: "enabled"}).valid?
+      # => false (missing name)
+
+      StructuredWorker.new(%{id: "123", name: "NewBiz", mode: "enabled"}).valid?
+      # => true
+
+  This shows how args, stored as JSON, are cast before passing to `process/1`:
+
+      # {"id":123,"name":"NewBiz","mode":"enabled","data":{"parent_id":456}}
+
+      %MyApp.StructuredWorker{
+        id: 123,
+        name: "NewBiz",
+        mode: :enabled,
+        data: %{parent_id:456}
+      }
+
+  #### Structured Types and Casting
+
+  Type casting and validation are handled by changesets. All types supported in Ecto schemas are
+  allowed, e.g. `:id`, `:integer`, `:string`, `:float`, or `:map`. See the [Ecto documentation for
+  a complete list of Ecto types][ecto] and their Elixir counterparts.
+
+  [ecto]: https://hexdocs.pm/ecto/3.9.4/Ecto.Schema.html#module-types-and-casting
+
+  #### Structured Extensions
+
+  Structured workers support some convenient extensions beyond Ecto's standard type casting.
+
+  * `:enum` — provide a list of atoms, e.g. `values: ~w(foo bar baz)a`, which both validates that
+    values are included in the list and casts them to an atom.
+
+  * `:uuid` — an intention revealing alias for `binary_id`
+
+  * `embeds_one/2,3` — declares a nested map with an explicit set of fields
+
+  * `embeds_many/2,3` — delcares a list of nested maps with an explicit set of fields
+
+  #### Defining Typespecs for Structured Workers
+
+  Typespecs aren't generated automatically. If desired, you must to define a sctuctured worker's
+  type manually:
+
+      defmodule MyApp.StructuredWorker do
+        use Oban.Pro.Worker
+
+        @type t :: %__MODULE__{id: integer(), active: boolean()}
+
+        ...
 
   ## Recorded Jobs
 
@@ -208,57 +285,60 @@ defmodule Oban.Pro.Worker do
   First, here's how to define a single implicit local hook on the worker using
   `c:after_process/2`:
 
-  ```elixir
-  defmodule MyApp.HookWorker do
-    use Oban.Pro.Worker
+      defmodule MyApp.HookWorker do
+        use Oban.Pro.Worker
 
-    @impl Oban.Pro.Worker
-    def process(_job) do
-      # ...
-    end
+        @impl Oban.Pro.Worker
+        def process(_job) do
+          # ...
+        end
 
-    @impl Oban.Pro.Worker
-    def after_process(state, %Job{} = job) do
-      MyApp.Notifier.broadcast("oban-jobs", {state, %{id: job.id}})
-    end
-  end
-  ```
+        @impl Oban.Pro.Worker
+        def after_process(state, %Job{} = job) do
+          MyApp.Notifier.broadcast("oban-jobs", {state, %{id: job.id}})
+        end
+      end
 
   Any module that exports `c:after_process/2` can be used as a hook. For example, here we'll
   define a shared error notification hook:
 
-  ```elixir
-  defmodule MyApp.ErrorHook do
-    def after_process(state, job) when state in [:discard, :error] do
-      error = job.unsaved_error
-      extra = Map.take([:attempt, :id, :args, :max_attempts, :meta, :queue, :worker])
+      defmodule MyApp.ErrorHook do
+        def after_process(state, job) when state in [:discard, :error] do
+          error = job.unsaved_error
+          extra = Map.take(job, [:attempt, :id, :args, :max_attempts, :meta, :queue, :worker])
 
-      Sentry.capture_exception(error.reason, stacktrace: error.stacktrace, extra: extra)
-    end
+          Sentry.capture_exception(error.reason, stacktrace: error.stacktrace, extra: extra)
+        end
 
-    def after_process(_state, _job), do: :ok
-  end
+        def after_process(_state, _job), do: :ok
+      end
 
-  defmodule MyApp.HookWorker do
-    use Oban.Pro.Worker, hooks: [MyApp.ErrorHook]
+      defmodule MyApp.HookWorker do
+        use Oban.Pro.Worker, hooks: [MyApp.ErrorHook]
 
-    @impl Oban.Pro.Worker
-    def process(_job) do
-      # ...
-    end
-  end
-  ```
+        @impl Oban.Pro.Worker
+        def process(_job) do
+          # ...
+        end
+      end
 
   The same module can be attached globally, for all `Oban.Pro.Worker` modules, using
   `attach_hook/1`:
 
-  ```elixir
-  :ok = Oban.Pro.Worker.attach_hook(MyApp.ErrorHook)
-  ```
+      :ok = Oban.Pro.Worker.attach_hook(MyApp.ErrorHook)
+
+  Attaching hooks in your application's `start/2` function is an easy way to ensure hooks are
+  registered before your application starts processing jobs.
+
+      def start(_type, _args) do
+        :ok = Oban.Pro.Worker.attach_hook(MyApp.ErrorHook)
+
+        children = [
+          ...
   """
 
   alias Oban.{Job, Worker}
-  alias Oban.Pro.Stages.{Hooks, Recorded, Structured}
+  alias Oban.Pro.Stages.{Encrypted, Hooks, Recorded, Standard, Structured}
 
   @typedoc """
   Options to enable and configure `encrypted` mode.
@@ -269,11 +349,6 @@ defmodule Oban.Pro.Worker do
   Options to enable and configure `recorded` mode.
   """
   @type recorded :: true | [to: atom(), limit: pos_integer(), safe_decode: boolean()]
-
-  @typedoc """
-  Options to enable and configure `structured` mode.
-  """
-  @type structured :: [keys: [atom()], required: [atom()]]
 
   @typedoc """
   All possible hook states.
@@ -307,37 +382,59 @@ defmodule Oban.Pro.Worker do
 
   @doc false
   defmacro __using__(opts) do
-    {stage_opts, stand_opts} = Keyword.split(opts, [:encrypted, :hooks, :recorded, :structured])
+    stand_opts = Keyword.drop(opts, [:encrypted, :hooks, :recorded, :structured])
 
-    quote location: :keep do
+    struc_opts =
+      opts
+      |> Keyword.get(:structured, [])
+      |> Structured.legacy_to_schema()
+
+    stage_opts = [
+      {Standard, stand_opts},
+      {Encrypted, Keyword.get(opts, :encrypted, :ignore)},
+      {Recorded, Keyword.get(opts, :recorded, :ignore)},
+      {Structured, []},
+      {Hooks, Keyword.get(opts, :hooks, [])}
+    ]
+
+    quote do
       @behaviour Oban.Worker
       @behaviour Oban.Pro.Worker
 
-      unquote(stage_opts)
-      |> Keyword.put_new(:standard, unquote(stand_opts))
-      |> Enum.map(&Oban.Pro.Worker.init_stage!(__MODULE__, &1))
-      |> Enum.each(fn {stage, conf} ->
-        if stage == Structured do
-          defstruct conf.keys
-                    |> MapSet.to_list()
-                    |> Enum.map(&String.to_existing_atom/1)
-        end
-      end)
+      @after_verify {__MODULE__, :__verify_stages__}
+
+      import Oban.Pro.Worker,
+        only: [
+          args_schema: 1,
+          field: 2,
+          field: 3,
+          embeds_one: 2,
+          embeds_one: 3,
+          embeds_many: 2,
+          embeds_many: 3
+        ]
 
       alias Oban.{Job, Worker}
 
+      @stand_opts Keyword.put(unquote(stand_opts), :worker, inspect(__MODULE__))
+      @stage_opts Enum.reject(unquote(stage_opts), &match?({_, :ignore}, &1))
+
+      if Enum.any?(unquote(struc_opts)) do
+        args_schema do
+          unquote(struc_opts)
+        end
+      end
+
+      @doc false
+      def __verify_stages__(module), do: module.__stages__()
+
       @doc false
       def __stages__ do
-        unquote(stage_opts)
-        |> Keyword.put_new(:standard, unquote(stand_opts))
-        |> Keyword.put_new(:hooks, [])
-        |> Enum.map(&Oban.Pro.Worker.init_stage!(__MODULE__, &1))
+        Enum.map(@stage_opts, &Oban.Pro.Worker.init_stage!(__MODULE__, &1))
       end
 
       def __opts__ do
-        unquote(stand_opts)
-        |> Keyword.put(:worker, inspect(__MODULE__))
-        |> Keyword.put(:stages, __stages__())
+        Keyword.put(@stand_opts, :stages, __stages__())
       end
 
       @impl Worker
@@ -378,6 +475,171 @@ defmodule Oban.Pro.Worker do
       end
 
       defoverridable backoff: 1, new: 2, perform: 1, timeout: 1
+    end
+  end
+
+  # Schema
+
+  @doc """
+  Define an args schema struct with field definitions and optional embedded structs.
+
+  The schema is used to validate args before insertion or execution. See the [Structured
+  Workers](#module-structured-jobs) section for more details.
+
+  ## Example
+
+  Define an args schema for a worker:
+
+      defmodule MyApp.Worker do
+        use Oban.Pro.Worker
+
+        args_schema do
+          field :id, :id, required: true
+          field :name, :string, required: true
+          field :mode, :enum, values: ~w(on off paused)a
+
+          embeds_one :address, required: true do
+            field :street, :string
+            field :number, :integer
+            field :city, :string
+          end
+        end
+
+        ...
+  """
+  @doc since: "0.14.0"
+  defmacro args_schema(do: block) do
+    quote do
+      Module.register_attribute(__MODULE__, :oban_fields, accumulate: true)
+
+      try do
+        import Oban.Pro.Worker,
+          only: [
+            field: 2,
+            field: 3,
+            embeds_one: 2,
+            embeds_one: 3,
+            embeds_many: 2,
+            embeds_many: 3
+          ]
+
+        unquote(block)
+      after
+        :ok
+      end
+
+      defstruct Enum.map(@oban_fields, &elem(&1, 0))
+
+      def __args_schema__, do: Enum.reverse(@oban_fields)
+    end
+  end
+
+  @doc false
+  defmacro field(name, type \\ :string, opts \\ []) do
+    check_type!(name, type)
+    check_opts!(name, type, opts)
+
+    opts = Keyword.put(opts, :type, type)
+
+    quote do
+      Module.put_attribute(__MODULE__, :oban_fields, {unquote(name), unquote(opts)})
+    end
+  end
+
+  @doc false
+  defmacro embeds_one(name, do: block) do
+    quote do
+      Oban.Pro.Worker.__embed__(__ENV__, :one, unquote(name), [], unquote(Macro.escape(block)))
+    end
+  end
+
+  @doc false
+  defmacro embeds_one(name, opts, do: block) do
+    quote do
+      Oban.Pro.Worker.__embed__(
+        __ENV__,
+        :one,
+        unquote(name),
+        unquote(opts),
+        unquote(Macro.escape(block))
+      )
+    end
+  end
+
+  @doc false
+  defmacro embeds_many(name, do: block) do
+    quote do
+      Oban.Pro.Worker.__embed__(__ENV__, :many, unquote(name), [], unquote(Macro.escape(block)))
+    end
+  end
+
+  @doc false
+  defmacro embeds_many(name, opts, do: block) do
+    quote do
+      Oban.Pro.Worker.__embed__(
+        __ENV__,
+        :many,
+        unquote(name),
+        unquote(opts),
+        unquote(Macro.escape(block))
+      )
+    end
+  end
+
+  @doc false
+  def __embed__(env, cardinality, name, opts, inner_block) do
+    block =
+      quote do
+        import Oban.Pro.Worker, only: [args_schema: 1]
+
+        args_schema do
+          unquote(inner_block)
+        end
+      end
+
+    module =
+      name
+      |> to_string()
+      |> Macro.camelize()
+      |> then(&Module.concat(env.module, &1))
+
+    required = Keyword.get(opts, :required, false)
+    opts = [cardinality: cardinality, module: module, required: required, type: :embed]
+
+    Module.create(module, block, env)
+    Module.put_attribute(env.module, :oban_fields, {name, opts})
+  end
+
+  defp check_type!(name, {:array, type}), do: check_type!(name, type)
+
+  defp check_type!(_name, :enum), do: :ok
+  defp check_type!(_name, :uuid), do: :ok
+
+  defp check_type!(name, type) do
+    unless Ecto.Type.base?(type) do
+      raise ArgumentError, "invalid type #{inspect(type)} for field #{inspect(name)}"
+    end
+  end
+
+  defp check_opts!(name, :enum, opts) do
+    opts
+    |> Keyword.keys()
+    |> Enum.sort()
+    |> case do
+      [:values] ->
+        :ok
+
+      [:required, :values] ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "invalid options #{inspect(opts)} for field #{inspect(name)}"
+    end
+  end
+
+  defp check_opts!(name, _type, opts) do
+    with {key, _} <- Enum.find(opts, fn {key, _} -> key not in [:required] end) do
+      raise ArgumentError, "invalid option #{inspect(key)} for field #{inspect(name)}"
     end
   end
 
@@ -423,17 +685,10 @@ defmodule Oban.Pro.Worker do
   # Stages
 
   @doc false
-  def init_stage!(worker, {stage_key, opts}) do
-    stage_mod =
-      stage_key
-      |> to_string()
-      |> Macro.camelize()
-
-    stage_mod = Module.concat(Oban.Pro.Stages, stage_mod)
-
+  def init_stage!(worker, {stage_mod, opts}) do
     case stage_mod.init(worker, opts) do
       {:ok, conf} -> {stage_mod, conf}
-      {:error, reason} -> raise ArgumentError, "#{stage_key}: " <> reason
+      {:error, reason} -> raise ArgumentError, "#{stage_mod}: " <> reason
     end
   end
 

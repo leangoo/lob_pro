@@ -1,13 +1,13 @@
 defmodule Oban.Pro.MixProject do
   use Mix.Project
 
-  @version "0.12.9"
+  @version "0.14.3"
 
   def project do
     [
       app: :oban_pro,
       version: @version,
-      elixir: "~> 1.11",
+      elixir: "~> 1.12",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
@@ -27,9 +27,9 @@ defmodule Oban.Pro.MixProject do
 
       # Dialyzer
       dialyzer: [
-        plt_add_apps: [:ex_unit, :libgraph, :mix],
+        plt_add_apps: [:ex_unit, :libgraph, :mix, :postgrex],
         plt_core_path: "_build/#{Mix.env()}",
-        flags: [:error_handling, :underspecs]
+        flags: [:error_handling, :missing_return, :underspecs]
       ]
     ]
   end
@@ -55,17 +55,18 @@ defmodule Oban.Pro.MixProject do
 
   defp deps do
     [
-      {:oban, "~> 2.13"},
+      {:oban, "~> 2.15.0"},
       {:ecto_sql, "~> 3.8"},
       {:libgraph, "~> 0.13", optional: true},
+      {:postgrex, "~> 0.16", optional: true},
       {:stream_data, "~> 0.5", only: [:test, :dev]},
       {:tzdata, "~> 1.0", only: [:test, :dev]},
       {:benchee, "~> 1.0", only: [:test, :dev], runtime: false},
-      {:credo, "~> 1.6", only: [:test, :dev], runtime: false},
+      {:credo, "~> 1.7", only: [:test, :dev], runtime: false},
       {:dialyxir, "~> 1.0", only: [:test, :dev], runtime: false},
-      {:ex_doc, "~> 0.21", only: [:dev], runtime: false},
-      {:makeup_diff, "~> 0.1", only: [:dev], runtime: false},
-      {:lys_publish, "~> 0.1", only: [:dev], path: "../lys_publish", runtime: false}
+      {:ex_doc, "~> 0.21", only: :dev, runtime: false},
+      {:makeup_diff, "~> 0.1", only: :dev, runtime: false},
+      {:lys_publish, "~> 0.1", only: :dev, path: "../lys_publish", optional: true, runtime: false}
     ]
   end
 
@@ -100,6 +101,7 @@ defmodule Oban.Pro.MixProject do
       extras: extras(),
       groups_for_extras: groups_for_extras(),
       groups_for_modules: groups_for_modules(),
+      nest_modules_by_prefix: nest_modules_by_prefix(),
       homepage_url: "/",
       skip_undefined_reference_warnings_on: ["CHANGELOG.md"],
       before_closing_body_tag: fn _ ->
@@ -116,11 +118,6 @@ defmodule Oban.Pro.MixProject do
       "guides/introduction/installation.md",
       "guides/introduction/adoption.md",
       "guides/extensions/smart_engine.md",
-      "guides/extensions/worker.md",
-      "guides/plugins/dynamic_cron.md",
-      "guides/plugins/dynamic_lifeline.md",
-      "guides/plugins/dynamic_queues.md",
-      "guides/plugins/reprioritizer.md",
       "guides/testing/testing.md",
       "guides/testing/testing_workers.md",
       "guides/deployment/docker.md",
@@ -134,7 +131,6 @@ defmodule Oban.Pro.MixProject do
     [
       Introduction: ~r/guides\/introduction\/.?/,
       Extensions: ~r/guides\/extensions\/.?/,
-      Plugins: ~r/guides\/plugins\/.?/,
       Workers: ~r/guides\/workers\/.?/,
       Testing: ~r/guides\/testing\/.?/,
       Deployment: ~r/guides\/deployment\/.?/
@@ -145,13 +141,19 @@ defmodule Oban.Pro.MixProject do
     [
       Extensions: [
         Oban.Pro.Relay,
+        Oban.Pro.Testing,
         Oban.Pro.Worker
       ],
       Plugins: [
-        Oban.Pro.Plugins.DynamicPruner
+        Oban.Pro.Plugins.DynamicCron,
+        Oban.Pro.Plugins.DynamicLifeline,
+        Oban.Pro.Plugins.DynamicPrioritizer,
+        Oban.Pro.Plugins.DynamicPruner,
+        Oban.Pro.Plugins.DynamicQueues,
+        Oban.Pro.Plugins.DynamicScaler
       ],
-      Testing: [
-        Oban.Pro.Testing
+      Scaling: [
+        Oban.Pro.Cloud
       ],
       Workers: [
         Oban.Pro.Workers.Batch,
@@ -159,5 +161,9 @@ defmodule Oban.Pro.MixProject do
         Oban.Pro.Workers.Workflow
       ]
     ]
+  end
+
+  defp nest_modules_by_prefix do
+    [Oban.Pro.Plugins, Oban.Pro.Workers]
   end
 end

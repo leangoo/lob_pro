@@ -3,7 +3,7 @@ defmodule Oban.Pro.Stages.Hooks do
 
   @behaviour Oban.Pro.Stage
 
-  alias Oban.Pro.Utils
+  alias Oban.Pro.{Utils, Worker}
 
   require Logger
 
@@ -47,13 +47,15 @@ defmodule Oban.Pro.Stages.Hooks do
 
   def handle_event(_event, _timing, %{job: job, state: state, worker: worker}, _conf) do
     with {:ok, worker} <- Oban.Worker.from_string(worker),
-         true <- function_exported?(worker, :__stages__, 0) do
+         true <- function_exported?(worker, :__stages__, 0),
+         opts = worker.__opts__(),
+         {:ok, job} <- Worker.before_process(job, opts) do
       hook_state = exec_to_hook_state(state)
 
       module_hooks =
-        worker.__stages__()
-        |> Keyword.get(__MODULE__, %{})
-        |> Map.get(:modules, [])
+        opts
+        |> get_in([:stages, __MODULE__, Access.key!(:modules)])
+        |> List.wrap()
 
       global_hooks = :persistent_term.get(:oban_pro_hooks, [])
 

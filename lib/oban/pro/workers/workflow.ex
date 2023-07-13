@@ -148,7 +148,9 @@ defmodule Oban.Pro.Workers.Workflow do
   The following example creates a workflow with all of the available options:
 
   ```elixir
-  workflow = MyWorkflow.new_workflow(
+  alias Oban.Pro.Workers.Workflow
+
+  workflow = Workflow.new(
     ignore_cancelled: true,
     ignore_deleted: true,
     ignore_discarded: true,
@@ -656,11 +658,18 @@ defmodule Oban.Pro.Workers.Workflow do
 
   # Public Interface
 
-  @doc false
-  def new(opts) do
-    id = Keyword.fetch!(opts, :workflow_id)
+  @doc """
+  Initialize a new workflow.
 
-    %__MODULE__{id: id, opts: Map.new(opts)}
+  """
+  @spec new(opts :: [new_option()]) :: t()
+  def new(opts \\ []) do
+    opts =
+      opts
+      |> Keyword.put_new_lazy(:workflow_id, &gen_id/0)
+      |> Map.new()
+
+    %__MODULE__{id: opts.workflow_id, opts: opts}
   end
 
   @doc false
@@ -772,21 +781,21 @@ defmodule Oban.Pro.Workers.Workflow do
         if meta.ignore_cancelled do
           module.process(job)
         else
-          {:discard, "upstream deps cancelled, workflow will never complete"}
+          {:cancel, "upstream deps cancelled, workflow will never complete"}
         end
 
       :discarded ->
         if meta.ignore_discarded do
           module.process(job)
         else
-          {:discard, "upstream deps discarded, workflow will never complete"}
+          {:cancel, "upstream deps discarded, workflow will never complete"}
         end
 
       :deleted ->
         if meta.ignore_deleted do
           module.process(job)
         else
-          {:discard, "upstream deps deleted, workflow will never complete"}
+          {:cancel, "upstream deps deleted, workflow will never complete"}
         end
     end
   end

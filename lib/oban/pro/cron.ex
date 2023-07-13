@@ -5,7 +5,6 @@ defmodule Oban.Pro.Cron do
 
   import Ecto.Changeset
 
-  alias Oban.Cron.Expression
   alias Oban.Worker
 
   @primary_key {:name, :string, autogenerate: false}
@@ -13,7 +12,7 @@ defmodule Oban.Pro.Cron do
     field :expression, :string
     field :worker, :string
     field :opts, :map
-    field :paused, :boolean, default: false
+    field :paused, :boolean
     field :lock_version, :integer, default: 1
 
     timestamps(
@@ -27,6 +26,9 @@ defmodule Oban.Pro.Cron do
   @requried ~w(name expression worker)a
   @allowed_opts ~w(args max_attempts priority queue tags timezone)a
 
+  @doc false
+  def allowed_opts, do: @allowed_opts
+
   @spec changeset({binary(), module()} | {binary(), module(), Keyword.t()}) :: Ecto.Changeset.t()
   def changeset({expression, worker}) do
     params = %{expression: expression, name: worker, worker: worker, opts: %{}}
@@ -36,7 +38,7 @@ defmodule Oban.Pro.Cron do
 
   def changeset({expression, worker, opts}) do
     {name, opts} = Keyword.pop(opts, :name, worker)
-    {paused, opts} = Keyword.pop(opts, :paused, false)
+    {paused, opts} = Keyword.pop(opts, :paused)
 
     params = %{
       expression: expression,
@@ -60,8 +62,6 @@ defmodule Oban.Pro.Cron do
     schema
     |> cast(params, @permitted)
     |> validate_required(@requried)
-    |> validate_change(:expression, &expression_validator/2)
-    |> validate_change(:opts, &opts_validator/2)
     |> optimistic_lock(:lock_version)
   end
 
@@ -84,25 +84,6 @@ defmodule Oban.Pro.Cron do
 
       _ ->
         params
-    end
-  end
-
-  defp expression_validator(:expression, expression) do
-    Expression.parse!(expression)
-
-    []
-  rescue
-    ArgumentError ->
-      [expression: "expected cron expression to be a parsable binary"]
-  end
-
-  defp opts_validator(:opts, opts) do
-    string_keys = Enum.map(@allowed_opts, &to_string/1)
-
-    if Enum.all?(opts, fn {key, _} -> to_string(key) in string_keys end) do
-      []
-    else
-      [opts: "expected cron opts to be one of #{inspect(@allowed_opts)}"]
     end
   end
 end

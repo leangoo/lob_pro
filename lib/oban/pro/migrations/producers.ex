@@ -12,7 +12,6 @@ defmodule Oban.Pro.Migrations.Producers do
       add :node, :text, null: false
       add :queue, :text, null: false
       add :meta, :map, null: false, default: %{}
-      add :running_ids, {:array, :bigint}, null: false, default: []
 
       add :started_at, :utc_datetime_usec,
         null: false,
