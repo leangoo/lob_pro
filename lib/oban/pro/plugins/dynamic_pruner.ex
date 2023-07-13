@@ -391,7 +391,6 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
 
     opts =
       opts
-      |> Keyword.delete(:interval)
       |> Keyword.put_new(:schedule, "* * * * *")
       |> Keyword.update!(:schedule, &Expression.parse!/1)
 

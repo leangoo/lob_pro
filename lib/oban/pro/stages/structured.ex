@@ -17,12 +17,6 @@ defmodule Oban.Pro.Stages.Structured do
     end
   end
 
-  def legacy_to_schema(opts) do
-    opts
-    |> to_normal()
-    |> to_quoted()
-  end
-
   @impl Oban.Pro.Stage
   def before_new(args, opts, :ignore), do: {:ok, args, opts}
 
@@ -121,55 +115,6 @@ defmodule Oban.Pro.Stages.Structured do
       else
         Changeset.add_error(changeset, key, "is an unexpected key")
       end
-    end)
-  end
-
-  # Legacy Updates
-
-  defp to_normal(opts) do
-    keys =
-      opts
-      |> Keyword.keys()
-      |> Enum.sort()
-
-    cond do
-      keys == [:keys, :required] ->
-        required = Keyword.get(opts, :required)
-
-        opts
-        |> Keyword.get(:keys)
-        |> Keyword.new(fn key ->
-          val = if key in required, do: {:*, :any}, else: :any
-
-          {key, val}
-        end)
-
-      keys == [:keys] ->
-        opts
-        |> Keyword.get(:keys)
-        |> Keyword.new(&{&1, :any})
-
-      true ->
-        opts
-    end
-  end
-
-  defp to_quoted(opts) do
-    Enum.map(opts, fn
-      {name, [v1 | _] = values} when is_atom(v1) ->
-        {:field, [], [name, :enum, [values: values]]}
-
-      {name, {:*, [v1 | _] = values}} when is_atom(v1) ->
-        {:field, [], [name, :enum, [required: true, values: values]]}
-
-      {name, {:*, type}} ->
-        {:field, [], [name, type, [required: true]]}
-
-      {name, [{_key, _val} | _] = nested} ->
-        {:embeds_one, [], [name, [do: {:__block__, [], to_quoted(nested)}]]}
-
-      {name, type} ->
-        {:field, [], [name, type]}
     end)
   end
 end

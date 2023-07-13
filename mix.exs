@@ -1,7 +1,7 @@
 defmodule Oban.Pro.MixProject do
   use Mix.Project
 
-  @version "0.14.3"
+  @version "1.0.0"
 
   def project do
     [
@@ -117,7 +117,6 @@ defmodule Oban.Pro.MixProject do
       "guides/introduction/overview.md",
       "guides/introduction/installation.md",
       "guides/introduction/adoption.md",
-      "guides/extensions/smart_engine.md",
       "guides/testing/testing.md",
       "guides/testing/testing_workers.md",
       "guides/deployment/docker.md",
@@ -130,8 +129,6 @@ defmodule Oban.Pro.MixProject do
   defp groups_for_extras do
     [
       Introduction: ~r/guides\/introduction\/.?/,
-      Extensions: ~r/guides\/extensions\/.?/,
-      Workers: ~r/guides\/workers\/.?/,
       Testing: ~r/guides\/testing\/.?/,
       Deployment: ~r/guides\/deployment\/.?/
     ]
@@ -139,6 +136,9 @@ defmodule Oban.Pro.MixProject do
 
   defp groups_for_modules do
     [
+      Engines: [
+        Oban.Pro.Engines.Smart
+      ],
       Extensions: [
         Oban.Pro.Relay,
         Oban.Pro.Testing,

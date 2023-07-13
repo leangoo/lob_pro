@@ -285,56 +285,65 @@ defmodule Oban.Pro.Worker do
   First, here's how to define a single implicit local hook on the worker using
   `c:after_process/2`:
 
-      defmodule MyApp.HookWorker do
-        use Oban.Pro.Worker
+  ```elixir
+  defmodule MyApp.HookWorker do
+    use Oban.Pro.Worker
 
-        @impl Oban.Pro.Worker
-        def process(_job) do
-          # ...
-        end
+    @impl Oban.Pro.Worker
+    def process(_job) do
+      # ...
+    end
 
-        @impl Oban.Pro.Worker
-        def after_process(state, %Job{} = job) do
-          MyApp.Notifier.broadcast("oban-jobs", {state, %{id: job.id}})
-        end
-      end
+    @impl Oban.Pro.Worker
+    def after_process(state, %Job{} = job) do
+      MyApp.Notifier.broadcast("oban-jobs", {state, %{id: job.id}})
+    end
+  end
+  ```
 
   Any module that exports `c:after_process/2` can be used as a hook. For example, here we'll
   define a shared error notification hook:
 
-      defmodule MyApp.ErrorHook do
-        def after_process(state, job) when state in [:discard, :error] do
-          error = job.unsaved_error
-          extra = Map.take(job, [:attempt, :id, :args, :max_attempts, :meta, :queue, :worker])
+  ```elixir
+  defmodule MyApp.ErrorHook do
+    def after_process(state, job) when state in [:discard, :error] do
+      error = job.unsaved_error
+      extra = Map.take(job, [:attempt, :id, :args, :max_attempts, :meta, :queue, :worker])
+      tags = %{oban_worker: job.worker, oban_queue: job.queue, oban_state: job.state}
 
-          Sentry.capture_exception(error.reason, stacktrace: error.stacktrace, extra: extra)
-        end
+      Sentry.capture_exception(error.reason, stacktrace: error.stacktrace, tags: tags, extra: extra)
+    end
 
-        def after_process(_state, _job), do: :ok
-      end
+    def after_process(_state, _job), do: :ok
+  end
 
-      defmodule MyApp.HookWorker do
-        use Oban.Pro.Worker, hooks: [MyApp.ErrorHook]
+  defmodule MyApp.HookWorker do
+    use Oban.Pro.Worker, hooks: [MyApp.ErrorHook]
 
-        @impl Oban.Pro.Worker
-        def process(_job) do
-          # ...
-        end
-      end
+    @impl Oban.Pro.Worker
+    def process(_job) do
+      # ...
+    end
+  end
+  ```
 
   The same module can be attached globally, for all `Oban.Pro.Worker` modules, using
   `attach_hook/1`:
 
-      :ok = Oban.Pro.Worker.attach_hook(MyApp.ErrorHook)
+  ```elixir
+  :ok = Oban.Pro.Worker.attach_hook(MyApp.ErrorHook)
+  ```
 
   Attaching hooks in your application's `start/2` function is an easy way to ensure hooks are
   registered before your application starts processing jobs.
 
-      def start(_type, _args) do
-        :ok = Oban.Pro.Worker.attach_hook(MyApp.ErrorHook)
+  ```elixir
+  def start(_type, _args) do
+    :ok = Oban.Pro.Worker.attach_hook(MyApp.ErrorHook)
 
-        children = [
-          ...
+    children = [
+      ...
+  ```
   """
 
   alias Oban.{Job, Worker}
@@ -382,12 +391,7 @@ defmodule Oban.Pro.Worker do
 
   @doc false
   defmacro __using__(opts) do
-    stand_opts = Keyword.drop(opts, [:encrypted, :hooks, :recorded, :structured])
-
-    struc_opts =
-      opts
-      |> Keyword.get(:structured, [])
-      |> Structured.legacy_to_schema()
+    stand_opts = Keyword.drop(opts, [:encrypted, :hooks, :recorded])
 
     stage_opts = [
       {Standard, stand_opts},
@@ -418,12 +422,6 @@ defmodule Oban.Pro.Worker do
 
       @stand_opts Keyword.put(unquote(stand_opts), :worker, inspect(__MODULE__))
       @stage_opts Enum.reject(unquote(stage_opts), &match?({_, :ignore}, &1))
-
-      if Enum.any?(unquote(struc_opts)) do
-        args_schema do
-          unquote(struc_opts)
-        end
-      end
 
       @doc false
       def __verify_stages__(module), do: module.__stages__()

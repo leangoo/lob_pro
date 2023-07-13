@@ -81,7 +81,7 @@ defmodule Oban.Pro.Workers.Chunk do
     use Oban.Pro.Workers.Chunk, by: [:worker, args: :author_id], size: 50, timeout: 30_000
 
     @impl true
-    def process([%{"author_id" => author_id} | _] = jobs) do
+    def process([%{args: %{"author_id" => author_id}} | _] = jobs) do
       messages =
         jobs
         |> Enum.map(& &1.args["message_id"])
@@ -145,6 +145,8 @@ defmodule Oban.Pro.Workers.Chunk do
   In the event of an ephemeral crash, like a network issue, the entire batch may be retried if
   there are any remaining attempts.
 
+  Cancelling any jobs in a chunk will cancel the _entire_ chunk, including the leader job.
+
   ## Chunk Organization
 
   Chunks are ran by a leader job (which has nothing to do with peer leadership). When the leader
@@ -159,7 +161,12 @@ defmodule Oban.Pro.Workers.Chunk do
   use Oban.Pro.Workers.Chunk, size: 50, sleep: 2_000, timeout: 10_000
   ```
 
-  Cancelling any jobs in a chunk will cancel the _entire_ chunk, including the leader job.
+  ### Optimizing Chunks
+
+  Queue's with high concurrency and low throughput may have multiple chunk leaders running
+  simultaneously rather than getting bundled into a single chunk. The solution is to reduce the
+  queue’s global concurrency to a smaller number so that new chunk leader jobs don’t start and the
+  existing chunk can run a bigger batch.
   """
 
   import Ecto.Query
@@ -389,8 +396,8 @@ defmodule Oban.Pro.Workers.Chunk do
     end
   end
 
-  # This replicates the query used in SmartEngine.fetch_jobs/3, without the meta tracking or any
-  # other complications. Any modifications to the original query must be replicated here. Another
+  # This replicates the query used in Smart.fetch_jobs/3, without the meta tracking or any other
+  # complications. Any modifications to the original query must be replicated here. Another
   defp fetch_chunk(conf, job, limit) do
     subset_query =
       Job
