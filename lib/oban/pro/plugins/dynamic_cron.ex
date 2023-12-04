@@ -7,11 +7,11 @@ defmodule Oban.Pro.Plugins.DynamicCron do
 
   ## Installation
 
-  Before running the `DynamicCron` plugin you must run a migration to add the `oban_cron` table to
-  your database.
+  Before running the `DynamicCron` plugin you must run a migration to add the `oban_crons` table
+  to your database.
 
   ```bash
-  mix ecto.gen.migration add_oban_cron
+  mix ecto.gen.migration add_oban_crons
   ```
 
   Open the generated migration in your editor and add a call to the migration's `change/0`
@@ -238,6 +238,7 @@ defmodule Oban.Pro.Plugins.DynamicCron do
           | {:max_attempts, pos_integer()}
           | {:paused, boolean()}
           | {:priority, 0..3}
+          | {:meta, map()}
           | {:name, cron_name()}
           | {:queue, atom() | String.t()}
           | {:tags, Job.tags()}
@@ -328,10 +329,9 @@ defmodule Oban.Pro.Plugins.DynamicCron do
   """
   @spec insert(term(), [cron_input()]) :: {:ok, [Ecto.Schema.t()]} | {:error, Ecto.Changeset.t()}
   def insert(oban_name \\ Oban, [_ | _] = crontab) do
-    oban_name
-    |> Oban.config()
-    |> insert_cron(crontab)
-    |> case do
+    conf = Oban.config(oban_name)
+
+    case insert_cron(conf, crontab) do
       {:ok, inserted} ->
         {:ok, Map.values(inserted)}
 
@@ -379,7 +379,7 @@ defmodule Oban.Pro.Plugins.DynamicCron do
       {:ok, _} = DynamicCron.update("cron-1", name: "special-cron")
   """
   @spec update(term(), cron_name(), [cron_opt()]) ::
-          {:ok, Ecto.Schema.t()} | {:error, Ecto.Changeset.t()}
+          {:ok, Ecto.Schema.t()} | {:error, Ecto.Changeset.t() | String.t()}
   def update(oban_name \\ Oban, name, opts) when is_name(name) do
     oban_name
     |> Oban.config()
@@ -402,7 +402,9 @@ defmodule Oban.Pro.Plugins.DynamicCron do
 
       {:ok, _} = DynamicCron.delete("cron-1")
   """
-  @spec delete(term(), cron_name()) :: {:ok, Ecto.Schema.t()} | {:error, Ecto.Changeset.t()}
+  @spec delete(term(), cron_name()) ::
+          {:ok, Ecto.Schema.t()}
+          | {:error, Ecto.Changeset.t() | String.t()}
   def delete(oban_name \\ Oban, name) when is_name(name) do
     oban_name
     |> Oban.config()

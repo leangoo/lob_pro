@@ -119,8 +119,8 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
     Oban.Pro.Plugins.DynamicPruner,
     mode: {:max_age, {7, :days}},
     queue_overrides: [events: {:max_age, {10, :minutes}}],
-    worker_overrides: ["MyApp.SecretWorker": {:max_age, {1, :second}}],
-    state_overrides: [discarded: {:max_age, {2, :days}}]
+    state_overrides: [discarded: {:max_age, {2, :days}}],
+    worker_overrides: ["MyApp.SecretWorker": {:max_age, {1, :second}}]
   }]
   ```
 
@@ -282,10 +282,9 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
 
   import Ecto.Query
 
-  alias Ecto.Multi
   alias Oban.Cron.Expression
   alias Oban.Plugins.Cron
-  alias Oban.{Config, Job, Peer, Repo, Validation}
+  alias Oban.{Job, Peer, Repo, Validation}
 
   @type time_unit ::
           :second
@@ -438,6 +437,10 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
     {:ok, datetime} = DateTime.now(state.timezone)
 
     if Peer.leader?(state.conf) and Expression.now?(state.schedule, datetime) do
+      string_queues = string_keys(state.queue_overrides)
+      string_states = string_keys(state.state_overrides)
+      string_workers = string_keys(state.worker_overrides)
+
       queue_pruned =
         for {queue, mode} <- state.queue_overrides do
           Job
@@ -461,9 +464,9 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
 
       default_pruned =
         Job
-        |> query_for_queues(:not, string_keys(state.queue_overrides))
-        |> query_for_states(:not, string_keys(state.state_overrides))
-        |> query_for_workers(:not, string_keys(state.worker_overrides))
+        |> query_for_queues(:not, string_queues)
+        |> query_for_states(:not, string_states)
+        |> query_for_workers(:not, string_workers)
         |> delete_for_mode(state.mode, state)
 
       pruned = List.flatten([queue_pruned, state_pruned, worker_pruned, default_pruned])
@@ -496,8 +499,8 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
     time = to_timestamp(age)
 
     query
-    |> where([j], j.attempted_at < ^time or j.cancelled_at < ^time or j.discarded_at < ^time)
-    |> select([j], %{id: j.id, queue: j.queue, state: j.state, worker: j.worker, rn: 100_000_000})
+    |> where([j], j.scheduled_at < ^time)
+    |> select([j], %{id: j.id, queue: j.queue, state: j.state, rn: 100_000_000})
     |> delete_all(state.limit + 1, state)
   end
 
@@ -507,18 +510,17 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
       id: j.id,
       queue: j.queue,
       state: j.state,
-      worker: j.worker,
       rn: fragment("row_number() over (order by id desc)")
     })
     |> delete_all(len, state)
   end
 
   defp delete_all(query, offset, state) do
-    %Config{log: log, prefix: prefix} = state.conf
-
     subquery =
       query
-      |> where([j], j.state in ["cancelled", "completed", "discarded"])
+      |> where([j], j.state in ~w(cancelled completed discarded))
+      |> where([j], not is_nil(j.queue))
+      |> where([j], j.priority in [0, 1, 2, 3])
       |> order_by(asc: :id)
       |> limit(^state.limit)
 
@@ -527,18 +529,17 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
       |> join(:inner, [j], x in subquery(subquery), on: j.id == x.id and x.rn > ^offset)
       |> select([_, x], map(x, [:id, :queue, :state]))
 
-    multi =
-      Multi.new()
-      |> Multi.run(:callback, &apply_before_delete(&1, &2, query, state))
-      |> Multi.delete_all(:deleted, query, log: log, prefix: prefix, timeout: state.timeout)
+    {:ok, {_count, deleted}} =
+      Repo.transaction(state.conf, fn ->
+        apply_before_delete(query, state)
 
-    {:ok, %{deleted: {_count, deleted}}} =
-      Repo.transaction(state.conf, multi, timeout: state.timeout)
+        Repo.delete_all(state.conf, query, timeout: state.timeout)
+      end)
 
     deleted
   end
 
-  defp apply_before_delete(_repo, _changes, query, state) do
+  defp apply_before_delete(query, state) do
     with {mod, fun, args} <- state.before_delete do
       ids =
         state.conf
@@ -548,8 +549,10 @@ defmodule Oban.Pro.Plugins.DynamicPruner do
       apply(mod, fun, [ids | args])
     end
 
-    {:ok, []}
+    :ok
   end
+
+  # Timestamp
 
   defp to_timestamp(seconds) when is_integer(seconds) do
     DateTime.add(DateTime.utc_now(), -seconds, :second)

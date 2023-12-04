@@ -114,7 +114,7 @@ defmodule Oban.Pro.Relay do
 
     changeset = Changeset.put_change(changeset, :meta, meta)
 
-    :ok = Notifier.listen(name, [:gossip])
+    :ok = Notifier.listen(name, [:relay])
 
     with {:ok, job} <- Oban.insert(name, changeset) do
       %__MODULE__{job: job, pid: pid, ref: ref}
@@ -160,7 +160,7 @@ defmodule Oban.Pro.Relay do
     check_ownership!(pid)
 
     receive do
-      {:notification, :gossip, %{"ref" => ^ref, "result" => result}} ->
+      {:notification, :relay, %{"ref" => ^ref, "result" => result}} ->
         Utils.decode64(result)
     after
       timeout -> {:error, :timeout}
@@ -228,7 +228,7 @@ defmodule Oban.Pro.Relay do
       ^error_ref ->
         for %{ref: ref} <- relays, do: replied[ref] || awaited[ref]
 
-      {:notification, :gossip, %{"ref" => ref, "result" => res}} ->
+      {:notification, :relay, %{"ref" => ref, "result" => res}} ->
         if Map.has_key?(awaited, ref) do
           await_many(
             relays,
@@ -247,7 +247,7 @@ defmodule Oban.Pro.Relay do
     with %{"await_ref" => aref} <- job.meta do
       payload = %{"ref" => aref, "result" => extract_result(conf, meta)}
 
-      Notifier.notify(conf, :gossip, payload)
+      Notifier.notify(conf, :relay, payload)
     end
   catch
     kind, value ->

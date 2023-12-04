@@ -20,8 +20,6 @@ defmodule Oban.Pro.Migrations.DynamicQueues do
         null: false,
         default: fragment("timezone('utc', now())")
     end
-
-    unique_index(:oban_cron, :name, prefix: prefix)
   end
 
   def up(opts \\ []) do

@@ -66,7 +66,7 @@ defmodule Oban.Pro.Stages.Hooks do
   catch
     kind, value ->
       Logger.error(fn ->
-        "[Oban.Pro.Worker] hook error: " <> Exception.format(kind, value)
+        "[Oban.Pro.Worker] hook error: " <> Exception.format(kind, value, __STACKTRACE__)
       end)
   end
 

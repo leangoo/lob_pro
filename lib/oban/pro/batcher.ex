@@ -8,7 +8,6 @@ defmodule Oban.Pro.Batcher do
 
   require Logger
 
-  @hash_size 2048
   @default_debounce 100
 
   @callbacks_to_functions %{
@@ -30,13 +29,20 @@ defmodule Oban.Pro.Batcher do
   }
 
   def on_start do
-    ref = :atomics.new(@hash_size, signed: false)
+    tab = :ets.new(:batcher, [:public, write_concurrency: true])
+
+    events = [
+      [:oban, :job, :stop],
+      [:oban, :job, :exception],
+      [:oban, :engine, :cancel_job, :stop],
+      [:oban, :engine, :cancel_all_jobs, :stop]
+    ]
 
     :telemetry.attach_many(
       "oban.batch",
-      [[:oban, :job, :stop], [:oban, :job, :exception]],
+      events,
       &__MODULE__.handle_event/4,
-      ref
+      tab
     )
   end
 
@@ -44,7 +50,15 @@ defmodule Oban.Pro.Batcher do
     :telemetry.detach("oban.batch")
   end
 
-  def handle_event(_event, _timing, %{conf: conf, job: job}, ref) do
+  def handle_event(_event, _timing, %{conf: conf, job: job}, tab) do
+    maybe_debounce(job, conf, tab)
+  end
+
+  def handle_event(_event, _timing, %{conf: conf, jobs: jobs}, tab) do
+    Enum.each(jobs, &maybe_debounce(&1, conf, tab))
+  end
+
+  defp maybe_debounce(job, conf, tab) do
     case job.meta do
       %{"batch_id" => _, "callback" => _} ->
         :ok
@@ -52,7 +66,7 @@ defmodule Oban.Pro.Batcher do
       %{"batch_id" => batch_id} ->
         delay = Map.get(job.meta, "batch_debounce", @default_debounce)
 
-        debounce(ref, batch_id, delay, fn -> check_and_insert(job, batch_id, conf) end)
+        debounce(tab, batch_id, delay, fn -> check_and_insert(job, batch_id, conf) end)
 
       _ ->
         :ok
@@ -67,15 +81,12 @@ defmodule Oban.Pro.Batcher do
       :ok
   end
 
-  defp debounce(ref, key, delay, fun) do
-    hash = :erlang.phash2(key, @hash_size)
-    time = :erlang.system_time(:millisecond)
-    last = :atomics.get(ref, hash)
+  defp debounce(_tab, _key, 0, fun), do: fun.()
 
-    if time > last do
-      :atomics.put(ref, hash, time + delay)
-      :timer.sleep(delay)
-
+  defp debounce(tab, key, delay, fun) do
+    if :ets.insert_new(tab, {key}) do
+      Process.sleep(delay)
+      :ets.delete(tab, key)
       fun.()
     else
       :ok

@@ -33,12 +33,17 @@ defmodule Oban.Pro.Stages.Recorded do
     with {:ok, return} <- result do
       encoded = Utils.encode64(return)
 
-      if byte_size(encoded) <= conf.limit do
-        Process.put(:oban_meta, Map.put(job.meta, to_string(conf.to), encoded))
+      cond do
+        job.conf.engine != Oban.Pro.Engines.Smart ->
+          {:error, "recording requires the Smart engine"}
 
-        :ok
-      else
-        {:error, "return is #{byte_size(encoded)} bytes, larger than the limit: #{conf.limit}"}
+        byte_size(encoded) > conf.limit ->
+          {:error, "return is #{byte_size(encoded)} bytes, larger than the limit: #{conf.limit}"}
+
+        true ->
+          Process.put(:oban_meta, Map.put(job.meta, to_string(conf.to), encoded))
+
+          :ok
       end
     end
   end

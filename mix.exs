@@ -1,7 +1,7 @@
 defmodule Oban.Pro.MixProject do
   use Mix.Project
 
-  @version "1.0.0"
+  @version "1.1.6"
 
   def project do
     [
@@ -55,12 +55,12 @@ defmodule Oban.Pro.MixProject do
 
   defp deps do
     [
-      {:oban, "~> 2.15.0"},
+      {:oban, ">= 2.15.4"},
       {:ecto_sql, "~> 3.8"},
       {:libgraph, "~> 0.13", optional: true},
       {:postgrex, "~> 0.16", optional: true},
       {:stream_data, "~> 0.5", only: [:test, :dev]},
-      {:tzdata, "~> 1.0", only: [:test, :dev]},
+      {:tz, "~> 0.26", only: [:test, :dev]},
       {:benchee, "~> 1.0", only: [:test, :dev], runtime: false},
       {:credo, "~> 1.7", only: [:test, :dev], runtime: false},
       {:dialyxir, "~> 1.0", only: [:test, :dev], runtime: false},
@@ -101,8 +101,9 @@ defmodule Oban.Pro.MixProject do
       extras: extras(),
       groups_for_extras: groups_for_extras(),
       groups_for_modules: groups_for_modules(),
-      nest_modules_by_prefix: nest_modules_by_prefix(),
       homepage_url: "/",
+      logo: "assets/oban-pro-logo.svg",
+      nest_modules_by_prefix: nest_modules_by_prefix(),
       skip_undefined_reference_warnings_on: ["CHANGELOG.md"],
       before_closing_body_tag: fn _ ->
         """
@@ -157,6 +158,7 @@ defmodule Oban.Pro.MixProject do
       ],
       Workers: [
         Oban.Pro.Workers.Batch,
+        Oban.Pro.Workers.Chain,
         Oban.Pro.Workers.Chunk,
         Oban.Pro.Workers.Workflow
       ]

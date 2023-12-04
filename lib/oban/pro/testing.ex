@@ -43,7 +43,7 @@ defmodule Oban.Pro.Testing do
   """
 
   import Ecto.Query, only: [where: 3]
-  import ExUnit.Assertions, only: [assert: 2]
+  import ExUnit.Assertions, only: [assert: 2, flunk: 1]
   import ExUnit.Callbacks, only: [on_exit: 2, start_supervised!: 1]
 
   alias Ecto.Adapters.SQL.Sandbox
@@ -102,10 +102,22 @@ defmodule Oban.Pro.Testing do
         |> Oban.Pro.Testing.all_enqueued()
       end
 
+      def assert_enqueue(opts \\ [], fun) do
+        unquote(repo_opts)
+        |> Keyword.merge(opts)
+        |> Oban.Pro.Testing.assert_enqueue(fun)
+      end
+
       def assert_enqueued(opts \\ [], timeout \\ :none) do
         unquote(repo_opts)
         |> Keyword.merge(opts)
         |> Oban.Pro.Testing.assert_enqueued(timeout)
+      end
+
+      def refute_enqueue(opts \\ [], fun) do
+        unquote(repo_opts)
+        |> Keyword.merge(opts)
+        |> Oban.Pro.Testing.refute_enqueue(fun)
       end
 
       def refute_enqueued(opts \\ [], timeout \\ :none) do
@@ -124,10 +136,6 @@ defmodule Oban.Pro.Testing do
         Oban.Pro.Testing.perform_job(worker, args, Keyword.merge(unquote(repo_opts), opts))
       end
 
-      def process_job(worker, args, opts \\ []) do
-        Oban.Pro.Testing.perform_job(worker, args, Keyword.merge(unquote(repo_opts), opts))
-      end
-
       def perform_callback(worker, callback, args, opts \\ []) do
         opts = Keyword.merge(unquote(repo_opts), opts)
 
@@ -140,6 +148,10 @@ defmodule Oban.Pro.Testing do
 
       def run_batch([_ | _] = batch, opts \\ []) do
         Oban.Pro.Testing.run_batch(batch, Keyword.merge(unquote(repo_opts), opts))
+      end
+
+      def run_chain([_ | _] = chain, opts \\ []) do
+        Oban.Pro.Testing.run_chain(chain, Keyword.merge(unquote(repo_opts), opts))
       end
 
       def run_chunk([_ | _] = chunk, opts \\ []) do
@@ -162,6 +174,11 @@ defmodule Oban.Pro.Testing do
     end
   end
 
+  @conf_keys []
+             |> Config.new()
+             |> Map.from_struct()
+             |> Map.keys()
+
   @callbacks ~w(attempted completed discarded exhausted)a
 
   @default_supervised_opts [
@@ -182,11 +199,53 @@ defmodule Oban.Pro.Testing do
   See [shared options](#module-shared-repo-options) for additional repo-specific options.
   """
   @doc since: "0.11.0"
-  @spec all_enqueued(Keyword.t()) :: [Job.t()]
+  @spec all_enqueued(keyword()) :: [Job.t()]
   def all_enqueued(opts) do
     {repo, opts} = Keyword.pop!(opts, :repo)
 
     Oban.Testing.all_enqueued(repo, opts)
+  end
+
+  @doc """
+  Assert that one or more jobs were enqueued during a function call.
+
+  Any pre-existing jobs are ignored for the assertion. If the assertion passes then the function's
+  return value is passed back.
+
+  ## Options
+
+  See [shared options](#module-shared-repo-options) for additional repo-specific options.
+
+  ## Examples
+
+  Assert that a `MyApp.Worker` job was added to the `default` queue:
+
+      assert_enqueue([queue: :default, worker: MyApp.Worker], fn ->
+        MyApp.do_some_business()
+      end)
+
+  Make an assertion about the return value:
+
+      result = assert_enqueue([worker: MyApp.Worker], &MyApp.more_business/0)
+
+      assert {:ok, _} = result
+  """
+  @doc since: "1.1.0"
+  @spec assert_enqueue(keyword(), (-> return)) :: return when return: any()
+  def assert_enqueue(opts, fun) when is_function(fun, 0) do
+    {enqueued, returned} = diff_enqueued(opts, fun)
+
+    if Enum.any?(enqueued) do
+      returned
+    else
+      flunk("""
+      Expected a job matching:
+
+      #{inspect_opts(opts)}
+
+      to be enqueued.
+      """)
+    end
   end
 
   @doc """
@@ -199,7 +258,7 @@ defmodule Oban.Pro.Testing do
   See [shared options](#module-shared-repo-options) for additional repo-specific options.
   """
   @doc since: "0.11.0"
-  @spec assert_enqueued(Keyword.t(), timeout() | :none) :: true
+  @spec assert_enqueued(keyword(), timeout() | :none) :: true
   def assert_enqueued(opts, timeout \\ :none) do
     {repo, opts} = Keyword.pop!(opts, :repo)
 
@@ -207,6 +266,48 @@ defmodule Oban.Pro.Testing do
       Oban.Testing.assert_enqueued(repo, opts)
     else
       Oban.Testing.assert_enqueued(repo, opts, timeout)
+    end
+  end
+
+  @doc """
+  Refute that any jobs were enqueued during a function call.
+
+  Any pre-existing jobs are ignored for the refutation. If the refutation passes then the
+  function's return value is passed back. 
+
+  ## Options
+
+  See [shared options](#module-shared-repo-options) for additional repo-specific options.
+
+  ## Examples
+
+  Refute that a `MyApp.Worker` job was added to the `default` queue:
+
+      refute_enqueue([queue: :default, worker: MyApp.Worker], fn ->
+        MyApp.do_some_business()
+      end)
+
+  Make a refutation about the return value:
+
+      result = refute_enqueue([worker: MyApp.Worker], &MyApp.more_business/0)
+
+      assert {:ok, _} = result
+  """
+  @doc since: "1.1.0"
+  @spec refute_enqueue(keyword(), (-> return)) :: return when return: any()
+  def refute_enqueue(opts, fun) when is_function(fun, 0) do
+    {enqueued, returned} = diff_enqueued(opts, fun)
+
+    if Enum.empty?(enqueued) do
+      returned
+    else
+      flunk("""
+      Expected no jobs matching:
+
+      #{inspect_opts(opts)}
+
+      to be enqueued.
+      """)
     end
   end
 
@@ -220,7 +321,7 @@ defmodule Oban.Pro.Testing do
   See [shared options](#module-shared-repo-options) for additional repo-specific options.
   """
   @doc since: "0.11.0"
-  @spec refute_enqueued(Keyword.t(), timeout() | :none) :: false
+  @spec refute_enqueued(keyword(), timeout() | :none) :: false
   def refute_enqueued(opts, timeout \\ :none) do
     {repo, opts} = Keyword.pop!(opts, :repo)
 
@@ -306,7 +407,7 @@ defmodule Oban.Pro.Testing do
   @doc since: "0.11.0"
   @spec drain_jobs([drain_option()]) :: drain_result()
   def drain_jobs(opts) when is_list(opts) do
-    {conf_opts, opts} = Keyword.split(opts, [:log, :prefix, :repo])
+    {conf_opts, opts} = Keyword.split(opts, @conf_keys)
 
     conf =
       @default_supervised_opts
@@ -331,7 +432,11 @@ defmodule Oban.Pro.Testing do
 
   @doc since: "0.11.0"
   @spec perform_job(Worker.t(), term(), [perform_option()]) :: Worker.result()
-  defdelegate perform_job(worker, args, opts), to: Oban.Testing
+  def perform_job(worker, args, opts) do
+    opts = Keyword.put_new(opts, :engine, Smart)
+
+    Oban.Testing.perform_job(worker, args, opts)
+  end
 
   @doc """
   Construct and execute a job with a batch `handle_*` callback.
@@ -383,29 +488,44 @@ defmodule Oban.Pro.Testing do
   @doc since: "0.11.0"
   @spec perform_chunk(Worker.t(), [term()], [perform_option()]) :: Chunk.result()
   def perform_chunk(worker, args_list, opts) when is_list(args_list) and is_list(opts) do
-    {conf_opts, opts} = Keyword.split(opts, [:log, :prefix, :repo])
+    {conf_opts, opts} = Keyword.split(opts, @conf_keys)
 
-    opts = Keyword.put_new(opts, :attempt, 1)
     conf = Config.new(conf_opts)
 
-    result =
-      args_list
-      |> Enum.map(fn args ->
+    opts =
+      opts
+      |> Keyword.merge(worker.__opts__())
+      |> Keyword.put_new(:attempt, 1)
+
+    chunk =
+      Enum.reduce_while(args_list, [], fn args, acc ->
         now = DateTime.utc_now()
 
-        args
-        |> worker.new(opts)
-        |> Changeset.update_change(:args, &json_encode_decode/1)
-        |> Changeset.put_change(:attempted_at, now)
-        |> Changeset.put_change(:scheduled_at, now)
-        |> Changeset.apply_action!(:insert)
-        |> Map.replace!(:conf, conf)
+        job =
+          args
+          |> worker.new(opts)
+          |> Changeset.update_change(:args, &json_encode_decode/1)
+          |> Changeset.put_change(:attempted_at, now)
+          |> Changeset.put_change(:scheduled_at, now)
+          |> Changeset.apply_action!(:insert)
+          |> Map.replace!(:conf, conf)
+
+        case Oban.Pro.Worker.before_process(job, opts) do
+          {:ok, job} ->
+            {:cont, [job | acc]}
+
+          {:error, error} ->
+            {:halt, {:error, error}}
+        end
       end)
+
+    if is_list(chunk) do
+      chunk
       |> worker.process()
-
-    assert_valid_chunk_result(result)
-
-    result
+      |> tap(&assert_valid_chunk_result/1)
+    else
+      chunk
+    end
   end
 
   @doc """
@@ -436,7 +556,35 @@ defmodule Oban.Pro.Testing do
   end
 
   @doc """
-  Insert and execute a chunked jobs within the test process.
+  Insert and execute chained jobs within the test process.
+
+  ## Options
+
+  Accepts all options for `drain_jobs/1`, including the repo-specific options listed in
+  [shared-options](#module-shared-repo-options).
+
+  ## Examples
+
+  Run all jobs in a chain:
+
+      1..10
+      |> Enum.map(&MyChain.new(%{id: &1}))
+      |> run_chain()
+  """
+  @doc since: "1.1.0"
+  def run_chain(chain, opts) when is_list(opts) do
+    chain_keys = ~w(hold_snooze on_cancelled on_discarded wait_retry wait_sleep wait_snooze)a
+    chain_opts = opts |> Keyword.take(chain_keys) |> Map.new()
+
+    chain
+    |> Enum.map(fn changeset ->
+      Changeset.update_change(changeset, :meta, &Map.merge(&1, chain_opts))
+    end)
+    |> run_jobs(opts)
+  end
+
+  @doc """
+  Insert and execute chunked jobs within the test process.
 
   This helper overrides the chunk's `timeout` to force immediate processing of jobs up to the
   chunk size.
@@ -493,7 +641,7 @@ defmodule Oban.Pro.Testing do
   @doc since: "0.11.0"
   @spec run_jobs([Job.changeset()], [drain_option()]) :: drain_result()
   def run_jobs([_ | _] = changesets, opts) when is_list(changesets) and is_list(opts) do
-    conf_opts = Keyword.take(opts, [:log, :prefix, :repo])
+    conf_opts = Keyword.take(opts, @conf_keys)
 
     @default_supervised_opts
     |> Keyword.merge(conf_opts)
@@ -615,6 +763,25 @@ defmodule Oban.Pro.Testing do
     |> Jason.decode!()
   end
 
+  # Enqueued Helpers
+
+  defp diff_enqueued(opts, fun) do
+    existing = all_enqueued(opts)
+    returned = fun.()
+    inserted = all_enqueued(opts)
+
+    existing_ids = Enum.map(existing, & &1.id)
+    difference = Enum.reject(inserted, &(&1.id in existing_ids))
+
+    {difference, returned}
+  end
+
+  defp inspect_opts(opts) do
+    opts
+    |> Keyword.drop([:log, :prefix, :repo])
+    |> inspect(charlists: :as_lists, pretty: true)
+  end
+
   # Callback Helpers
 
   defp assert_valid_callback(worker, callback) do
@@ -690,6 +857,15 @@ defmodule Oban.Pro.Testing do
       case meta do
         %{"batch_id" => _} ->
           %{job | meta: Map.put_new(meta, "batch_debounce", 1)}
+
+        %{"chain_key" => _} ->
+          meta =
+            meta
+            |> Map.put_new("wait_retry", 1)
+            |> Map.put_new("wait_sleep", 1)
+            |> Map.put_new("wait_snooze", 1)
+
+          %{job | meta: meta}
 
         %{"chunk_size" => _} ->
           meta =
