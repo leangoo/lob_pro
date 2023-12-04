@@ -213,29 +213,29 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
 
   use GenServer
 
-  import Ecto.Query, only: [order_by: 2, where: 2]
+  import Ecto.Query, only: [from: 2, order_by: 2, where: 2]
 
-  alias Ecto.Multi
+  alias Ecto.{Changeset, Multi}
   alias Oban.Pro.Engines.Smart
   alias Oban.Pro.{Queue, Utils}
   alias Oban.{Config, Midwife, Notifier, Peer, Registry, Repo, Validation}
 
-  @type period :: pos_integer() | {:seconds | :minutes | :hours | :days, pos_integer()}
-  @type partition :: [fields: [:worker | :args], keys: [atom()]]
+  @type period :: Smart.period()
+  @type partition :: Smart.partition()
 
   @type operator :: :== | :!= | :=~
   @type pattern :: boolean() | String.t()
   @type sys_key :: String.t()
   @type oban_name :: term()
 
-  @type queue_name :: atom()
-  @type queue_input :: [{queue_name(), pos_integer() | queue_opts()}]
+  @type queue_name :: atom() | binary()
+  @type queue_input :: [{queue_name(), pos_integer() | queue_opts() | [queue_opts()]}]
   @type queue_opts ::
           {:local_limit, pos_integer()}
-          | {:global_limit, pos_integer()}
+          | {:global_limit, Smart.global_limit()}
           | {:only, only()}
           | {:paused, boolean()}
-          | {:rate_limit, [allowed: pos_integer(), period: period(), partition: partition()]}
+          | {:rate_limit, Smart.rate_limit()}
 
   @type only ::
           {:node, pattern()}
@@ -365,9 +365,11 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
 
     with {:ok, queue} <- fetch_queue(conf, to_string(name)),
          {:ok, queue} <- update_queue(conf, queue, opts) do
-      if queue.name != to_string(name) do
-        :ok = notify(conf, :dyn_start, queue.name)
-        :ok = notify(conf, :dyn_stop, name)
+      if queue.name == to_string(name) do
+        Oban.scale_queue(oban_name, Keyword.put(opts, :queue, name))
+      else
+        notify(conf, :dyn_start, queue.name)
+        notify(conf, :dyn_stop, name)
       end
 
       {:ok, queue}
@@ -536,15 +538,28 @@ defmodule Oban.Pro.Plugins.DynamicQueues do
   defp append_operation(conf, tuple, multi) do
     changeset = Queue.changeset(tuple)
 
-    replace =
-      changeset.changes
-      |> Map.take([:only, :opts])
-      |> Map.keys()
+    opts_json =
+      changeset
+      |> Changeset.get_embed(:opts, :struct)
+      |> Ecto.embedded_dump(:json)
+      |> Enum.reject(fn {_key, val} -> is_nil(val) end)
+      |> Map.new()
+
+    on_conflict =
+      if Changeset.changed?(changeset, :only) do
+        from q in Queue,
+          update: [
+            set: [opts: fragment("? || ?", q.opts, ^opts_json)],
+            set: [only: ^Changeset.get_embed(changeset, :only, :struct)]
+          ]
+      else
+        from q in Queue, update: [set: [opts: fragment("? || ?", q.opts, ^opts_json)]]
+      end
 
     repo_opts = [
       prefix: conf.prefix,
       conflict_target: :name,
-      on_conflict: {:replace, replace}
+      on_conflict: on_conflict
     ]
 
     Multi.insert(multi, changeset.changes.name, changeset, repo_opts)

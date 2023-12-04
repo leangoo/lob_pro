@@ -174,6 +174,7 @@ defmodule Oban.Pro.Workers.Chunk do
 
   alias Ecto.Multi
   alias Oban.{CrashError, Job, Notifier, PerformError, Repo, Validation}
+  alias Oban.Pro.Utils
 
   @type key_or_keys :: atom() | [atom()]
 
@@ -191,11 +192,12 @@ defmodule Oban.Pro.Workers.Chunk do
           | {:cancel | :discard | :error, reason :: term(), [Job.t()]}
           | [cancel: sub_result(), discard: sub_result(), error: sub_result()]
 
-  @type option ::
-          {:by, chunk_by()}
-          | {:size, pos_integer()}
-          | {:sleep, pos_integer()}
-          | {:timeout, pos_integer()}
+  @type options :: [
+          by: chunk_by(),
+          size: pos_integer(),
+          sleep: pos_integer(),
+          timeout: pos_integer()
+        ]
 
   # Purely used for validation
   defstruct [:by, :size, :sleep, :timeout]
@@ -220,19 +222,10 @@ defmodule Oban.Pro.Workers.Chunk do
 
       @impl Oban.Worker
       def new(args, opts) when is_map(args) and is_list(opts) do
-        normalize_chunk_by = fn by ->
-          by
-          |> List.wrap()
-          |> Enum.map(fn
-            {key, val} -> [key, List.wrap(val)]
-            field -> field
-          end)
-        end
-
         opts =
           opts
           |> Keyword.update(:meta, @default_meta, &Map.merge(@default_meta, &1))
-          |> update_in([:meta, :chunk_by], normalize_chunk_by)
+          |> update_in([:meta, :chunk_by], &Utils.normalize_by/1)
 
         super(args, opts)
       end
@@ -253,26 +246,12 @@ defmodule Oban.Pro.Workers.Chunk do
   @doc false
   def validate(opts) do
     Validation.validate(opts, fn
-      {:by, by} -> validate_chunk_by(by)
+      {:by, by} -> Oban.Pro.Validation.validate_by(by)
       {:size, size} -> Validation.validate_integer(:size, size)
       {:sleep, sleep} -> Validation.validate_timeout(:sleep, sleep)
       {:timeout, timeout} -> Validation.validate_timeout(:timeout, timeout)
       option -> {:unknown, option, __MODULE__}
     end)
-  end
-
-  defp validate_chunk_by(:worker), do: :ok
-  defp validate_chunk_by({:args, key}) when is_atom(key), do: :ok
-  defp validate_chunk_by({:meta, key}) when is_atom(key), do: :ok
-  defp validate_chunk_by({:args, [key | _]}) when is_atom(key), do: :ok
-  defp validate_chunk_by({:meta, [key | _]}) when is_atom(key), do: :ok
-  defp validate_chunk_by([:worker, {:args, key}]) when is_atom(key), do: :ok
-  defp validate_chunk_by([:worker, {:meta, key}]) when is_atom(key), do: :ok
-  defp validate_chunk_by([:worker, {:args, [key | _]}]) when is_atom(key), do: :ok
-  defp validate_chunk_by([:worker, {:meta, [key | _]}]) when is_atom(key), do: :ok
-
-  defp validate_chunk_by(fields) do
-    {:error, "expected :by to be :worker, an :args/:meta tuple, got: #{inspect(fields)}"}
   end
 
   # Public Interface

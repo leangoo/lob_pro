@@ -69,6 +69,15 @@ defmodule Oban.Pro.Utils do
     end
   end
 
+  def normalize_by(by) do
+    by
+    |> List.wrap()
+    |> Enum.map(fn
+      {key, val} -> [key, List.wrap(val)]
+      field -> field
+    end)
+  end
+
   @spec to_exception(Changeset.t()) :: Exception.t()
   def to_exception(changeset) do
     changeset

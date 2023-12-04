@@ -170,6 +170,8 @@ defmodule Oban.Pro.Producer do
   @doc false
   @spec global_changeset(Ecto.Schema.t(), integer() | map() | Keyword.t()) :: Changeset.t()
   def global_changeset(schema, params) do
+    params = Map.update(params, :partition, nil, &normalize_partition/1)
+
     schema
     |> cast(params, ~w(allowed)a)
     |> cast_embed(:partition, with: &partition_changeset/2)
@@ -183,6 +185,7 @@ defmodule Oban.Pro.Producer do
     params =
       params
       |> Map.update(:period, nil, &cast_period/1)
+      |> Map.update(:partition, nil, &normalize_partition/1)
       |> Map.put_new_lazy(:window_time, fn -> DateTime.to_unix(DateTime.utc_now(), :second) end)
 
     schema
@@ -200,7 +203,7 @@ defmodule Oban.Pro.Producer do
     params =
       params
       |> Map.new()
-      |> Map.update(:fields, [], &Utils.maybe_stringify_list/1)
+      |> Map.update(:fields, nil, &Utils.maybe_stringify_list/1)
       |> Map.update(:keys, [], &Utils.maybe_stringify_list/1)
 
     schema
@@ -218,14 +221,7 @@ defmodule Oban.Pro.Producer do
     %{allowed: limit}
   end
 
-  def cast_global_limit([[key | _] | _] = opts) when is_binary(key) do
-    opts
-    |> Enum.map(&List.to_tuple/1)
-    |> Map.new()
-    |> cast_global_limit()
-  end
-
-  def cast_global_limit(opts), do: opts
+  def cast_global_limit(opts), do: cast_rate_limit(opts)
 
   # Rate Limit Helpers
 
@@ -273,6 +269,32 @@ defmodule Oban.Pro.Producer do
   end
 
   def cast_period(period), do: period
+
+  defp normalize_partition(partition) do
+    cond do
+      is_nil(partition) ->
+        nil
+
+      is_map(partition) ->
+        partition
+
+      Keyword.keyword?(partition) and Keyword.has_key?(partition, :fields) ->
+        partition
+
+      true ->
+        partition
+        |> List.wrap()
+        |> Enum.reduce([fields: [], keys: []], fn
+          {:args, keys}, opts ->
+            opts
+            |> Keyword.put(:keys, List.wrap(keys))
+            |> Keyword.update!(:fields, &[:args | &1])
+
+          field, opts ->
+            Keyword.update!(opts, :fields, &[field | &1])
+        end)
+    end
+  end
 
   # Helpers
 

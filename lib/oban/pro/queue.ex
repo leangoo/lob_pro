@@ -26,8 +26,8 @@ defmodule Oban.Pro.Queue do
 
       field :local_limit, :integer
       field :paused, :boolean
-      field :retry_attempts, :integer, default: 5
-      field :retry_backoff, :integer, default: :timer.seconds(1)
+      field :retry_attempts, :integer
+      field :retry_backoff, :integer
 
       embeds_one :global_limit, GlobalLimit, on_replace: :update, primary_key: false do
         @moduledoc false
@@ -106,9 +106,10 @@ defmodule Oban.Pro.Queue do
   end
 
   defp opts_changeset(schema, params) do
+    params = Map.new(params, fn {key, val} -> {Utils.maybe_to_atom(key), val} end)
+
     params =
       params
-      |> Map.new(fn {key, val} -> {Utils.maybe_to_atom(key), val} end)
       |> Map.delete(:limit)
       |> Map.put_new_lazy(:local_limit, fn -> Producer.default_local_limit(params, schema) end)
 

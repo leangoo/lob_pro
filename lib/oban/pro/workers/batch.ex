@@ -132,17 +132,17 @@ defmodule Oban.Pro.Workers.Batch do
   * `c:handle_attempted/1` — called after **all jobs** in the batch were attempted at least once,
     regardless of whether they succeeded or not.
 
-  * `c:handle_cancelled/1` — called after **any jobs** in the batch have a `cancelled` state.
+  * `c:handle_cancelled/1` — called after **the first job** in a batch has `cancelled` state.
 
   * `c:handle_completed/1` — called after **all jobs** in the batch have a `completed` state. This
     handler may never be called if one or more jobs keep failing or any are discarded.
 
-  * `c:handle_discarded/1` — called after **any jobs** in the batch have a `discarded` state.
+  * `c:handle_discarded/1` — called after **the first job** in a batch has a `discarded` state.
 
   * `c:handle_exhausted/1` — called after **all jobs** in the batch have a `cancelled`,
     `completed` or `discarded` state.
 
-  * `c:handle_retryable/1` — called after **any jobs** in the batch have a `retryable` state.
+  * `c:handle_retryable/1` — called after **the first job** in a batch has a `retryable` state.
 
   Each handler callback receives an `Oban.Job` struct with the `batch_id` in `meta` and should
   return `:ok`. The callbacks are executed as separate isolated jobs, so they may be retried or

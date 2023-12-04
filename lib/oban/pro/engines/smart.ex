@@ -55,6 +55,27 @@ defmodule Oban.Pro.Engines.Smart do
   Oban.insert_all(lots_of_jobs, xact_limit: 20_000)
   ```
 
+  ## Snooze Attempts
+
+  Unlike the `Basic` engine which increments `attempts` and `max_attempts`, the Smart engine rolls
+  back the `attempt` on snooze. This approach preserves the original `max_attempts` and records a
+  `snoozed` count in `meta`. As a result, it's simple to differentiate between "real" attempts and
+  snoozes, and backoff calculation remains accurate regardless of snoozing.
+
+  The following `process/1` function demonstrates checking a job's `meta` for a `snoozed` count:
+
+  ```elixir
+  def process(job) do
+    case job.meta do
+      %{"snoozed" => snoozed} ->
+        IO.inspect(snoozed, label: "The number of previous snoozes")
+
+      _ ->
+        # This job has never snoozed before
+    end
+  end
+  ```
+
   ## Global Concurrency
 
   Global concurrency limits the number of concurrent jobs that run across all nodes.
@@ -141,13 +162,13 @@ defmodule Oban.Pro.Engines.Smart do
 
   ```elixir
   # Partition by worker alone
-  partition: [fields: [:worker]]
+  partition: :worker
 
   # Partition by the `id` and `account_id` from args, ignoring the worker
-  partition: [fields: [:args], keys: [:id, :account_id]]
+  partition: [args: [:id, :account_id]]
 
   # Partition by worker and the `account_id` key from args
-  partition: [fields: [:worker, :args], keys: [:account_id]]
+  partition: [:worker, args: :account_id]
   ```
 
   Remember, take care to minimize partition cardinality by using a few `keys` whenever possible.
@@ -162,7 +183,7 @@ defmodule Oban.Pro.Engines.Smart do
   Consider the following example:
 
   ```elixir
-  global_limit: [allowed: 1, partition: [fields: [:worker]]]
+  global_limit: [allowed: 1, partition: :worker]
   ```
 
   The queue is configured to run one job per-worker across every node, but only 10 concurrently on a
@@ -172,7 +193,7 @@ defmodule Oban.Pro.Engines.Smart do
   Alternatively, you could partition by a single key:
 
   ```elixir
-  global_limit: [allowed: 1, partition: [fields: [:args], keys: [:tenant_id]]]
+  global_limit: [allowed: 1, partition: [args: :tenant_id]]
   ```
 
   That configures the queue to run one job concurrently across the entire cluster per `tenant_id`.
@@ -186,7 +207,7 @@ defmodule Oban.Pro.Engines.Smart do
   queue in your cluster:
 
   ```elixir
-  local_limit: 10, rate_limit: [allowed: 1, period: 5, partition: [fields: [:worker]]]
+  local_limit: 10, rate_limit: [allowed: 1, period: 5, partition: :worker]
   ```
 
   ## Producer Migrations
@@ -222,7 +243,11 @@ defmodule Oban.Pro.Engines.Smart do
   alias Oban.Pro.Limiters.{Global, Rate}
   alias Oban.Pro.{Producer, Utils}
 
-  @type partition :: [fields: [:args | :worker], keys: [atom()]]
+  @type partition ::
+          :worker
+          | {:args, atom()}
+          | [:worker | {:args, atom()}]
+          | [fields: [:worker | :args], keys: [atom()]]
 
   @type period :: pos_integer() | {pos_integer(), unit()}
 
@@ -234,21 +259,26 @@ defmodule Oban.Pro.Engines.Smart do
 
   @type unit :: :second | :seconds | :minute | :minutes | :hour | :hours | :day | :days
 
-  @base_batch_size 1_000
-  @base_xact_limit 10_000
-  @uniq_batch_size 250
+  @query_opts Application.compile_env(:oban_pro, __MODULE__, %{})
+
+  @base_batch_size Map.get(@query_opts, :base_batch_size, 1_000)
+  @base_xact_limit Map.get(@query_opts, :base_xact_limit, 10_000)
+  @uniq_batch_size Map.get(@query_opts, :uniq_batch_size, 250)
+  @partition_limit Map.get(@query_opts, :partition_limit, 5_000)
 
   defmacrop dec_tracked_count(meta, key) do
     quote do
       fragment(
         """
-        CASE (? #> ?)::text::int
+        CASE coalesce((? #> ?)::text::int, 0)
+        WHEN 0 THEN ?
         WHEN 1 THEN ? #- ?
         ELSE jsonb_set(?, ?, ((? #> ?)::text::int - 1)::text::jsonb)
         END
         """,
         unquote(meta),
         ["global_limit", "tracked", unquote(key), "count"],
+        unquote(meta),
         unquote(meta),
         ["global_limit", "tracked", unquote(key)],
         unquote(meta),
@@ -389,7 +419,7 @@ defmodule Oban.Pro.Engines.Smart do
       |> flatten_windows()
 
     producer
-    |> Map.take([:name, :node, :queue, :started_at, :updated_at])
+    |> Map.take([:name, :node, :queue, :uuid, :started_at, :updated_at])
     |> Map.put(:running, jids)
     |> Map.merge(meta)
   end
@@ -502,16 +532,25 @@ defmodule Oban.Pro.Engines.Smart do
   end
 
   @impl Engine
-  def snooze_job(%Config{} = conf, %Job{} = job, seconds) do
-    updates = [
-      set: [state: "scheduled", scheduled_at: seconds_from_now(seconds)],
-      inc: [max_attempts: 1]
-    ]
+  def snooze_job(%Config{} = conf, %Job{meta: meta} = job, seconds) do
+    snoozed = Map.get(meta, "snoozed", 0)
+
+    query =
+      Job
+      |> where(id: ^job.id)
+      |> update([j],
+        inc: [attempt: -1],
+        set: [
+          meta: fragment("? || ?", j.meta, ^%{snoozed: snoozed + 1}),
+          state: "scheduled",
+          scheduled_at: ^seconds_from_now(seconds)
+        ]
+      )
 
     Multi.new()
     |> Multi.put(:conf, conf)
     |> Multi.put(:job, job)
-    |> Multi.update_all(:set, where(Job, id: ^job.id), updates, oper_opts(conf))
+    |> Multi.update_all(:set, query, [], oper_opts(conf))
     |> Multi.run(:ack, &ack_job/2)
     |> transaction(conf)
 
@@ -558,7 +597,7 @@ defmodule Oban.Pro.Engines.Smart do
       Job
       |> join(:inner, [j], x in subquery(subquery), on: j.id == x.id)
       |> update(set: [state: "cancelled", cancelled_at: ^utc_now()])
-      |> select([_, x], map(x, [:id, :args, :attempted_by, :queue, :state, :worker]))
+      |> select([_, x], map(x, [:id, :args, :attempted_by, :meta, :queue, :state, :worker]))
 
     {:ok, %{jobs: {_count, jobs}}} =
       Multi.new()
@@ -597,7 +636,7 @@ defmodule Oban.Pro.Engines.Smart do
 
         jobs
 
-      uniq_count < xact_limit ->
+      xact_limit < uniq_count ->
         inner_insert_all(conf, changesets, opts)
 
       true ->
@@ -803,15 +842,20 @@ defmodule Oban.Pro.Engines.Smart do
       partition_by = partition_by_fields(partition)
       order_by = [asc: :priority, asc: :scheduled_at, asc: :id]
 
+      subquery =
+        Job
+        |> select([:id])
+        |> where(state: "available", queue: ^producer.queue)
+        |> order_by(^order_by)
+        |> limit(@partition_limit)
+
       partitioned_query =
         Job
+        |> join(:inner, [j], x in subquery(subquery), on: j.id == x.id)
         |> select([j], %{id: j.id, priority: j.priority, scheduled_at: j.scheduled_at})
         |> select_merge([j], %{worker: j.worker, args: j.args})
         |> select_merge([j], %{rank: over(dense_rank(), :partition)})
         |> windows([j], partition: [partition_by: ^partition_by, order_by: ^order_by])
-        |> where(state: "available", queue: ^producer.queue)
-        |> order_by(^order_by)
-        |> limit(^max(limit * 10, 100))
 
       conditions = demands_to_conditions(demands, limiter)
 
@@ -952,13 +996,14 @@ defmodule Oban.Pro.Engines.Smart do
   end
 
   defp ack_cancelled_jobs(_repo, %{conf: conf, jobs: {_count, jobs}}) do
-    jobs
-    |> Enum.filter(&(&1.state == "executing"))
-    |> Enum.group_by(& &1.queue)
-    |> Enum.map(fn {_queue, [job | _] = jobs} -> {get_producer(conf, job), jobs} end)
-    |> Enum.each(fn {producer, jobs} ->
-      for job <- jobs, do: ack_job(conf, producer, job)
-    end)
+    for job <- jobs, job.state == "executing", reduce: %{} do
+      acc ->
+        producer = Map.get_lazy(acc, job.attempted_by, fn -> get_producer(conf, job) end)
+
+        ack_job(conf, producer, job)
+
+        acc
+    end
 
     {:ok, nil}
   end
@@ -1052,8 +1097,9 @@ defmodule Oban.Pro.Engines.Smart do
       query
     else
       since = DateTime.add(utc_now(), period * -1, :second)
+      timestamp = Map.get(unique, :timestamp, :inserted_at)
 
-      dynamic([j], j.inserted_at >= ^since and ^query)
+      dynamic([j], field(j, ^timestamp) >= ^since and ^query)
     end
   end
 

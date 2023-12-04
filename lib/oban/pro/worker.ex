@@ -51,11 +51,12 @@ defmodule Oban.Pro.Worker do
         args_schema do
           field :id, :id, required: true
           field :name, :string, required: true
-          field :mode, :enum, values: ~w(enabled disabled paused)a
+          field :mode, :enum, values: ~w(enabled disabled paused)a, default: :enabled
+          field :xtra, :term
 
           embeds_one :data, required: true do
             field :office_id, :uuid, required: true
-            field :has_notes, :boolean
+            field :has_notes, :boolean, default: false
             field :addons, {:array, :string}
           end
 
@@ -110,18 +111,37 @@ defmodule Oban.Pro.Worker do
 
   [ecto]: https://hexdocs.pm/ecto/3.9.4/Ecto.Schema.html#module-types-and-casting
 
+  #### Structured Options
+
+  Structured fields support a few common options.
+
+  * `:default` — Sets the default value for a field. The default value is calculated at
+    compilation time, so don't use expressions like `DateTime.utc_now/0` as they'd be the same for
+    all records.
+
+  * `:required` — Validates that a value is provided for the field. Values that are `nil` or an
+    empty string aren't considered valid.
+
   #### Structured Extensions
 
   Structured workers support some convenient extensions beyond Ecto's standard type casting.
 
-  * `:enum` — provide a list of atoms, e.g. `values: ~w(foo bar baz)a`, which both validates that
-    values are included in the list and casts them to an atom.
+  * `:enum` — Maps atoms to strings based on a list of predefiend atoms passed like `values:
+    ~w(foo bar baz)a`. Both validates that values are included in the list and casts them to an
+    atom.
+
+  * `:term` — Safely encodes any Elixir term as a string for storage, then decodes it back to the
+    original term on load. This is similar to `:any`, but works with terms like tuples or pids
+    that can't usually be serialied. For safety, terms are encoded with the `:safe` option to
+    prevent decoding data that may be used to attack the runtime.
 
   * `:uuid` — an intention revealing alias for `binary_id`
 
-  * `embeds_one/2,3` — declares a nested map with an explicit set of fields
+  * `{:array, *}` — A list of one or more values of any type, including `:enum` and `:uuid`
 
-  * `embeds_many/2,3` — delcares a list of nested maps with an explicit set of fields
+  * `embeds_one/2,3` — Declares a nested map with an explicit set of fields
+
+  * `embeds_many/2,3` — Delcares a list of nested maps with an explicit set of fields
 
   #### Defining Typespecs for Structured Workers
 
@@ -467,9 +487,7 @@ defmodule Oban.Pro.Worker do
 
       @impl Oban.Pro.Worker
       def fetch_recorded(%Job{} = job) do
-        conf = Keyword.fetch!(__stages__(), Recorded)
-
-        Recorded.fetch_recorded(job, conf)
+        Oban.Pro.Worker.fetch_recorded(job)
       end
 
       defoverridable backoff: 1, new: 2, perform: 1, timeout: 1
@@ -495,6 +513,7 @@ defmodule Oban.Pro.Worker do
           field :id, :id, required: true
           field :name, :string, required: true
           field :mode, :enum, values: ~w(on off paused)a
+          field :safe, :boolean, default: false
 
           embeds_one :address, required: true do
             field :street, :string
@@ -610,8 +629,7 @@ defmodule Oban.Pro.Worker do
 
   defp check_type!(name, {:array, type}), do: check_type!(name, type)
 
-  defp check_type!(_name, :enum), do: :ok
-  defp check_type!(_name, :uuid), do: :ok
+  defp check_type!(_name, type) when type in ~w(enum term uuid)a, do: :ok
 
   defp check_type!(name, type) do
     unless Ecto.Type.base?(type) do
@@ -619,24 +637,15 @@ defmodule Oban.Pro.Worker do
     end
   end
 
-  defp check_opts!(name, :enum, opts) do
-    opts
-    |> Keyword.keys()
-    |> Enum.sort()
-    |> case do
-      [:values] ->
-        :ok
+  defp check_opts!(name, type, opts) do
+    allowed =
+      if type in [:enum, {:array, :enum}] do
+        [:default, :required, :values]
+      else
+        [:default, :required]
+      end
 
-      [:required, :values] ->
-        :ok
-
-      _ ->
-        raise ArgumentError, "invalid options #{inspect(opts)} for field #{inspect(name)}"
-    end
-  end
-
-  defp check_opts!(name, _type, opts) do
-    with {key, _} <- Enum.find(opts, fn {key, _} -> key not in [:required] end) do
+    with {key, _} <- Enum.find(opts, fn {key, _} -> key not in allowed end) do
       raise ArgumentError, "invalid option #{inspect(key)} for field #{inspect(name)}"
     end
   end
@@ -737,6 +746,19 @@ defmodule Oban.Pro.Worker do
         other -> {:halt, other}
       end
     end)
+  end
+
+  @doc false
+  def fetch_recorded(job) do
+    with {:ok, worker} <- Worker.from_string(job.worker) do
+      case Keyword.fetch(worker.__stages__(), Recorded) do
+        {:ok, conf} ->
+          Recorded.fetch_recorded(job, conf)
+
+        :error ->
+          {:error, "job isn't configured for recording"}
+      end
+    end
   end
 
   # Telemetry
